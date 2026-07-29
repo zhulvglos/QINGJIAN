@@ -1,0 +1,31 @@
+# IDE / Python generated files
+.idea/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local environments, downloaded models and caches
+runtime/
+models/
+cache/
+logs/
+
+# User data, credentials, recordings and generated indexes
+.env
+.env.*
+data.json
+news_cache.json
+interview_kb_index.json
+recordings/
+*.wav
+*.mp3
+*.flac
+*.log
+
+# Personal knowledge base (create locally when needed)
+面试知识库/
+
+# Packaging artifacts
+build/
+dist/
+*.spec
