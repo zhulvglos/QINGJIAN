@@ -2675,6 +2675,14 @@ class StickyNotesApp:
     def active_news_cache(self):
         return self.flash_cache if self.news_mode == "flash" else self.news_cache
 
+    @staticmethod
+    def flash_cache_complete(payload):
+        items = (payload or {}).get("items") or []
+        return bool(items) and all(isinstance(item, dict) and
+            str(item.get("features") or "").strip() and
+            str(item.get("use_cases") or "").strip()
+            for item in items)
+
     def update_news_tabs(self):
         if not hasattr(self, "news_daily_tab"):
             return
@@ -2702,16 +2710,20 @@ class StickyNotesApp:
         target_date = effective_flash_date() if is_flash else effective_daily_date()
         memory_cache = self.flash_cache if is_flash else self.news_cache
         cache_path = self.flash_cache_path if is_flash else self.news_cache_path
-        if not force and memory_cache and memory_cache.get("date") == target_date:
+        memory_complete = not is_flash or self.flash_cache_complete(memory_cache)
+        if not force and memory_cache and memory_complete and memory_cache.get("date") == target_date:
             self.apply_news_payload(memory_cache)
             return
+        if is_flash and memory_cache and not memory_complete:
+            self.flash_cache = None
         disk_cache = load_daily_cache(cache_path)
         if disk_cache:
-            if is_flash:
+            disk_complete = not is_flash or self.flash_cache_complete(disk_cache)
+            if is_flash and disk_complete:
                 self.flash_cache = disk_cache
-            else:
+            elif not is_flash:
                 self.news_cache = disk_cache
-            if not force and disk_cache.get("date") == target_date:
+            if not force and disk_complete and disk_cache.get("date") == target_date:
                 self.apply_news_payload(disk_cache)
                 return
         if mode in self.news_loading_modes:
@@ -2817,8 +2829,8 @@ class StickyNotesApp:
                       f"模型：{item.get('model_id') or item.get('title', '')}\n"
                       f"截止：{item.get('expires_at') or '未公布'}\n"
                       f"状态：{item.get('status') or '待核验'} · 可信度：{item.get('confidence') or '未知'}\n\n"
-                      f"特点：{item.get('features') or '请查看来源页'}\n"
-                      f"适用场景：{item.get('use_cases') or '请查看来源页'}\n\n"
+                      f"特点：{item.get('features', '')}\n\n"
+                      f"适用场景：{item.get('use_cases', '')}\n\n"
                       f"{item.get('summary', '')}\n\n来源：{item.get('source_name', '公开来源')}\n"
                       f"链接：{item.get('source_url', '')}")
         else:

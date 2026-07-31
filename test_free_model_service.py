@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from free_model_service import (FREE_MODEL_DAILY_URL, effective_flash_date,
                                 normalize_free_model_digest)
 from news_service import NewsServiceError
+from main import StickyNotesApp
 
 
 class FreeModelServiceTests(unittest.TestCase):
@@ -30,6 +31,15 @@ class FreeModelServiceTests(unittest.TestCase):
     def test_rejects_empty_digest(self):
         with self.assertRaises(NewsServiceError):
             normalize_free_model_digest({"date": "2026-07-31", "items": []})
+
+    def test_old_cache_without_summaries_is_incomplete(self):
+        payload = {"items": [{"title": "旧条目", "features": "", "use_cases": ""}]}
+        self.assertFalse(StickyNotesApp.flash_cache_complete(payload))
+
+    def test_cache_with_source_summaries_is_complete(self):
+        payload = {"items": [{
+            "title": "新条目", "features": "模型特点总结。", "use_cases": "适合代码审查。"}]}
+        self.assertTrue(StickyNotesApp.flash_cache_complete(payload))
 
 
 if __name__ == "__main__":
