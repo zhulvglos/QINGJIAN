@@ -41,6 +41,26 @@ class FreeModelServiceTests(unittest.TestCase):
             "title": "新条目", "features": "模型特点总结。", "use_cases": "适合代码审查。"}]}
         self.assertTrue(StickyNotesApp.flash_cache_complete(payload))
 
+    def test_switching_news_tab_only_changes_selected_state(self):
+        class FakeButton:
+            def __init__(self):
+                self.states = []
+
+            def state(self, values):
+                self.states.append(values)
+
+        app = StickyNotesApp.__new__(StickyNotesApp)
+        app.news_daily_tab = FakeButton()
+        app.news_flash_tab = FakeButton()
+        app.news_mode = "flash"
+        app.update_news_tabs()
+        self.assertEqual(app.news_daily_tab.states[-1], ["!selected"])
+        self.assertEqual(app.news_flash_tab.states[-1], ["selected"])
+        app.news_mode = "daily"
+        app.update_news_tabs()
+        self.assertEqual(app.news_daily_tab.states[-1], ["selected"])
+        self.assertEqual(app.news_flash_tab.states[-1], ["!selected"])
+
 
 if __name__ == "__main__":
     unittest.main()

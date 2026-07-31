@@ -406,9 +406,11 @@ class StickyNotesApp:
         self.news_tabs_frame = tk.Frame(self.root, padx=8, pady=2)
         self.bg_widgets.append(self.news_tabs_frame)
         self.news_daily_tab = ttk.Button(
-            self.news_tabs_frame, text="AI 日报", command=lambda: self.switch_news_mode("daily"))
+            self.news_tabs_frame, text="AI 日报", style="NewsTab.TButton",
+            command=lambda: self.switch_news_mode("daily"))
         self.news_flash_tab = ttk.Button(
-            self.news_tabs_frame, text="免费模型快讯", command=lambda: self.switch_news_mode("flash"))
+            self.news_tabs_frame, text="免费模型快讯", style="NewsTab.TButton",
+            command=lambda: self.switch_news_mode("flash"))
         self.news_daily_tab.pack(side="left", fill="x", expand=True, padx=(0, 2))
         self.news_flash_tab.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
@@ -1391,12 +1393,9 @@ class StickyNotesApp:
         toolbar_padding = self.style.lookup("TButton", "padding") or 5
         self.style.configure("NewsTab.TButton", background=c["panel"], foreground=c["text"],
                              font=toolbar_font, padding=toolbar_padding)
-        self.style.map("NewsTab.TButton", background=[("active", c["accent"])],
-                       foreground=[("active", "white")])
-        self.style.configure("NewsActive.TButton", background=c["accent"], foreground="white",
-                             font=toolbar_font, padding=toolbar_padding)
-        self.style.map("NewsActive.TButton", background=[("active", c["accent"])],
-                       foreground=[("active", "white")])
+        self.style.map("NewsTab.TButton",
+                       background=[("selected", c["accent"]), ("active", c["accent"])],
+                       foreground=[("selected", "white"), ("active", "white")])
         self.update_news_tabs()
         if save:
             self.store.settings["theme"] = self.theme_name
@@ -2686,10 +2685,10 @@ class StickyNotesApp:
     def update_news_tabs(self):
         if not hasattr(self, "news_daily_tab"):
             return
-        self.news_daily_tab.configure(
-            style="NewsActive.TButton" if self.news_mode == "daily" else "NewsTab.TButton")
-        self.news_flash_tab.configure(
-            style="NewsActive.TButton" if self.news_mode == "flash" else "NewsTab.TButton")
+        self.news_daily_tab.state(
+            ["selected"] if self.news_mode == "daily" else ["!selected"])
+        self.news_flash_tab.state(
+            ["selected"] if self.news_mode == "flash" else ["!selected"])
 
     def switch_news_mode(self, mode):
         if mode not in ("daily", "flash"):
