@@ -8,8 +8,8 @@ from news_service import NewsServiceError
 
 
 FREE_MODEL_DAILY_URL = (
-    "https://github.com/zhulvglos/QINGJIAN/releases/download/"
-    "free-model-daily/daily.json"
+    "https://raw.githubusercontent.com/zhulvglos/QINGJIAN/"
+    "daily-data/daily.json"
 )
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 USER_AGENT = "LightNote/0.5 (free model digest)"

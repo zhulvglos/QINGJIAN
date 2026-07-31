@@ -15,6 +15,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build daily digest
         run: python scripts/build_free_model_digest.py --output "$RUNNER_TEMP/daily.json"
+      - name: Replace fixed data branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir "$RUNNER_TEMP/daily-publish"
+          cp "$RUNNER_TEMP/daily.json" "$RUNNER_TEMP/daily-publish/daily.json"
+          cd "$RUNNER_TEMP/daily-publish"
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b daily-data
+          git add daily.json
+          git commit -m "更新免费模型每日快讯"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin daily-data
       - name: Create fixed release if missing
         env:
           GH_TOKEN: ${{ github.token }}

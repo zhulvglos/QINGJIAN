@@ -1387,7 +1387,13 @@ class StickyNotesApp:
         self.style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
         self.style.configure("Horizontal.TScale", background=c["bg"])
         self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"])
-        self.style.configure("NewsActive.TButton", background=c["accent"], foreground="white")
+        tab_font_size = max(10, round(10 * UI_FONT_SCALINGS.get(self.ui_font_size, 1.0)))
+        self.style.configure("NewsTab.TButton", background=c["panel"], foreground=c["text"],
+                             font=("Microsoft YaHei UI", tab_font_size), padding=(8, 7))
+        self.style.map("NewsTab.TButton", background=[("active", c["accent"])],
+                       foreground=[("active", "white")])
+        self.style.configure("NewsActive.TButton", background=c["accent"], foreground="white",
+                             font=("Microsoft YaHei UI", tab_font_size, "bold"), padding=(8, 7))
         self.style.map("NewsActive.TButton", background=[("active", c["accent"])],
                        foreground=[("active", "white")])
         self.update_news_tabs()
@@ -2672,15 +2678,17 @@ class StickyNotesApp:
         if not hasattr(self, "news_daily_tab"):
             return
         self.news_daily_tab.configure(
-            style="NewsActive.TButton" if self.news_mode == "daily" else "TButton")
+            style="NewsActive.TButton" if self.news_mode == "daily" else "NewsTab.TButton")
         self.news_flash_tab.configure(
-            style="NewsActive.TButton" if self.news_mode == "flash" else "TButton")
+            style="NewsActive.TButton" if self.news_mode == "flash" else "NewsTab.TButton")
 
     def switch_news_mode(self, mode):
         if mode not in ("daily", "flash"):
             return
         self.news_mode = mode
         self.current_news = None
+        self.news_items = []
+        self.listbox.delete(0, "end")
         self.update_news_tabs()
         self.update_toolbar_labels()
         self.show_news_loading("正在读取免费模型快讯……" if mode == "flash"

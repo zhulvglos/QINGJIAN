@@ -1,11 +1,17 @@
 import unittest
 from datetime import datetime, timezone, timedelta
 
-from free_model_service import effective_flash_date, normalize_free_model_digest
+from free_model_service import (FREE_MODEL_DAILY_URL, effective_flash_date,
+                                normalize_free_model_digest)
 from news_service import NewsServiceError
 
 
 class FreeModelServiceTests(unittest.TestCase):
+    def test_digest_uses_non_redirecting_raw_url(self):
+        self.assertEqual(
+            FREE_MODEL_DAILY_URL,
+            "https://raw.githubusercontent.com/zhulvglos/QINGJIAN/daily-data/daily.json")
+
     def test_business_date_changes_at_nine_beijing(self):
         tz = timezone(timedelta(hours=8))
         self.assertEqual(effective_flash_date(datetime(2026, 7, 31, 8, 59, tzinfo=tz)),
