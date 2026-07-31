@@ -33,7 +33,7 @@ def normalize_free_model_digest(payload: Dict) -> Dict:
         item = {key: str(raw.get(key) or "").strip() for key in (
             "category", "title", "summary", "source_name", "source_url",
             "permalink", "free_type", "access_type", "model_id", "expires_at",
-            "verified_at", "confidence", "status")}
+            "verified_at", "confidence", "status", "features", "use_cases")}
         item["category"] = item["category"] or "其他模型"
         item["source_name"] = item["source_name"] or "公开来源"
         item["permalink"] = item["permalink"] or item["source_url"]

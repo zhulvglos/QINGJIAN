@@ -1387,13 +1387,14 @@ class StickyNotesApp:
         self.style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
         self.style.configure("Horizontal.TScale", background=c["bg"])
         self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"])
-        tab_font_size = max(10, round(10 * UI_FONT_SCALINGS.get(self.ui_font_size, 1.0)))
+        toolbar_font = self.style.lookup("TButton", "font") or "TkDefaultFont"
+        toolbar_padding = self.style.lookup("TButton", "padding") or 5
         self.style.configure("NewsTab.TButton", background=c["panel"], foreground=c["text"],
-                             font=("Microsoft YaHei UI", tab_font_size), padding=(8, 7))
+                             font=toolbar_font, padding=toolbar_padding)
         self.style.map("NewsTab.TButton", background=[("active", c["accent"])],
                        foreground=[("active", "white")])
         self.style.configure("NewsActive.TButton", background=c["accent"], foreground="white",
-                             font=("Microsoft YaHei UI", tab_font_size, "bold"), padding=(8, 7))
+                             font=toolbar_font, padding=toolbar_padding)
         self.style.map("NewsActive.TButton", background=[("active", c["accent"])],
                        foreground=[("active", "white")])
         self.update_news_tabs()
@@ -2816,6 +2817,8 @@ class StickyNotesApp:
                       f"模型：{item.get('model_id') or item.get('title', '')}\n"
                       f"截止：{item.get('expires_at') or '未公布'}\n"
                       f"状态：{item.get('status') or '待核验'} · 可信度：{item.get('confidence') or '未知'}\n\n"
+                      f"特点：{item.get('features') or '请查看来源页'}\n"
+                      f"适用场景：{item.get('use_cases') or '请查看来源页'}\n\n"
                       f"{item.get('summary', '')}\n\n来源：{item.get('source_name', '公开来源')}\n"
                       f"链接：{item.get('source_url', '')}")
         else:
