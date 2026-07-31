@@ -1,0 +1,28 @@
+name: Free model daily digest
+
+on:
+  schedule:
+    - cron: "15 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build daily digest
+        run: python scripts/build_free_model_digest.py --output "$RUNNER_TEMP/daily.json"
+      - name: Create fixed release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view free-model-daily >/dev/null 2>&1 || \
+            gh release create free-model-daily --title "免费模型每日快讯" \
+              --notes "此固定 Release 仅保留当天 daily.json，每日覆盖，不保存历史快讯。"
+      - name: Replace daily asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload free-model-daily "$RUNNER_TEMP/daily.json" --clobber

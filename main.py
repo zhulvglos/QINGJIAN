@@ -35,6 +35,7 @@ from windows_integration import (autostart_enabled, load_ai_token, save_ai_token
                                  send_windows_notification, set_autostart)
 from news_service import (NewsServiceError, effective_daily_date, fetch_daily,
                           load_daily_cache, save_daily_cache)
+from free_model_service import (effective_flash_date, fetch_free_model_digest)
 from interview_knowledge_base import InterviewKnowledgeBase
 
 
@@ -198,11 +199,15 @@ class StickyNotesApp:
         self.current_news: Optional[Dict] = None
         self.news_cache: Optional[Dict] = None
         self.news_cache_path = self.store.path.parent / "news_cache.json"
+        self.flash_cache: Optional[Dict] = None
+        self.flash_cache_path = self.store.path.parent / "free_models_cache.json"
+        self.news_mode = "daily"
         self.interview_knowledge_base = InterviewKnowledgeBase(
             Path(__file__).resolve().parent / "面试知识库",
             self.store.path.parent / "interview_kb_index.json")
         self.news_items = []
         self.news_loading = False
+        self.news_loading_modes = set()
         self.news_results = queue.Queue()
         self.news_poll_job = None
         self.ai_dialog = None
@@ -397,6 +402,15 @@ class StickyNotesApp:
         self.news_source_button = ttk.Button(toolbar, text="打开原文", command=self.open_news_source)
         self.record_button = ttk.Button(
             toolbar, text="🎙 录音", command=lambda: self.open_ai_interview("recording"))
+
+        self.news_tabs_frame = tk.Frame(self.root, padx=8, pady=2)
+        self.bg_widgets.append(self.news_tabs_frame)
+        self.news_daily_tab = ttk.Button(
+            self.news_tabs_frame, text="AI 日报", command=lambda: self.switch_news_mode("daily"))
+        self.news_flash_tab = ttk.Button(
+            self.news_tabs_frame, text="免费模型快讯", command=lambda: self.switch_news_mode("flash"))
+        self.news_daily_tab.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        self.news_flash_tab.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         self.ai_interview_frame = tk.Frame(self.root, padx=8, pady=3)
         self.bg_widgets.append(self.ai_interview_frame)
@@ -1373,6 +1387,10 @@ class StickyNotesApp:
         self.style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
         self.style.configure("Horizontal.TScale", background=c["bg"])
         self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"])
+        self.style.configure("NewsActive.TButton", background=c["accent"], foreground="white")
+        self.style.map("NewsActive.TButton", background=[("active", c["accent"])],
+                       foreground=[("active", "white")])
+        self.update_news_tabs()
         if save:
             self.store.settings["theme"] = self.theme_name
             self.store.save()
@@ -2447,6 +2465,7 @@ class StickyNotesApp:
         if self.settings_visible:
             self.section_nav.pack_forget()
             self.body.pack_forget()
+            self.news_tabs_frame.pack_forget()
             self.ai_interview_frame.pack_forget()
             self.clear_toolbar_layout()
             self.settings_button_text.set("← 返回")
@@ -2457,12 +2476,18 @@ class StickyNotesApp:
             self.settings_button_text.set("⚙ 设置")
             self.section_nav.pack(fill="x", padx=8, pady=(5, 1), after=self.titlebar)
             self.configure_toolbar_for_section()
-            self.body.pack(fill="both", expand=True, padx=8, pady=8, after=self.toolbar)
+            if self.current_section == "news":
+                self.news_tabs_frame.pack(fill="x", after=self.toolbar)
+                self.body.pack(fill="both", expand=True, padx=8, pady=8,
+                               after=self.news_tabs_frame)
+            else:
+                self.body.pack(fill="both", expand=True, padx=8, pady=8, after=self.toolbar)
             self.sync_ai_interview_entry()
             self.root.after_idle(self.adjust_responsive_sash)
 
     def sync_ai_interview_entry(self):
         self.ai_interview_frame.pack_forget()
+        self.news_tabs_frame.pack_forget()
 
     def clear_toolbar_layout(self):
         buttons = (self.new_button, self.delete_button, self.calendar_button,
@@ -2481,8 +2506,12 @@ class StickyNotesApp:
         if self.current_section in full_new:
             self.new_button_text.set("＋ 新建" if compact else full_new[self.current_section])
         self.calendar_button.configure(text="📅 日历" if compact else "📅 日历视图")
-        self.news_home_button.configure(text="AI HOT" if compact else "打开 AI HOT")
-        self.news_source_button.configure(text="原文" if compact else "打开原文")
+        if self.news_mode == "flash":
+            self.news_home_button.configure(text="快讯" if compact else "打开快讯页")
+            self.news_source_button.configure(text="来源" if compact else "打开来源")
+        else:
+            self.news_home_button.configure(text="AI HOT" if compact else "打开 AI HOT")
+            self.news_source_button.configure(text="原文" if compact else "打开原文")
         self.record_button.configure(text="录音" if compact else "🎙 录音")
 
     def configure_toolbar_for_section(self):
@@ -2636,33 +2665,65 @@ class StickyNotesApp:
         else:
             self.status_var.set(f"{day} 暂无提醒")
 
-    def load_news(self, force=False):
-        target_date = effective_daily_date()
-        if not force and self.news_cache and self.news_cache.get("date") == target_date:
-            self.apply_news_payload(self.news_cache)
+    def active_news_cache(self):
+        return self.flash_cache if self.news_mode == "flash" else self.news_cache
+
+    def update_news_tabs(self):
+        if not hasattr(self, "news_daily_tab"):
             return
-        disk_cache = load_daily_cache(self.news_cache_path)
+        self.news_daily_tab.configure(
+            style="NewsActive.TButton" if self.news_mode == "daily" else "TButton")
+        self.news_flash_tab.configure(
+            style="NewsActive.TButton" if self.news_mode == "flash" else "TButton")
+
+    def switch_news_mode(self, mode):
+        if mode not in ("daily", "flash"):
+            return
+        self.news_mode = mode
+        self.current_news = None
+        self.update_news_tabs()
+        self.update_toolbar_labels()
+        self.show_news_loading("正在读取免费模型快讯……" if mode == "flash"
+                               else "正在获取 AI HOT 今日日报……")
+        self.load_news(False)
+
+    def load_news(self, force=False):
+        mode = self.news_mode
+        is_flash = mode == "flash"
+        target_date = effective_flash_date() if is_flash else effective_daily_date()
+        memory_cache = self.flash_cache if is_flash else self.news_cache
+        cache_path = self.flash_cache_path if is_flash else self.news_cache_path
+        if not force and memory_cache and memory_cache.get("date") == target_date:
+            self.apply_news_payload(memory_cache)
+            return
+        disk_cache = load_daily_cache(cache_path)
         if disk_cache:
-            self.news_cache = disk_cache
+            if is_flash:
+                self.flash_cache = disk_cache
+            else:
+                self.news_cache = disk_cache
             if not force and disk_cache.get("date") == target_date:
                 self.apply_news_payload(disk_cache)
                 return
-        if self.news_loading:
+        if mode in self.news_loading_modes:
             return
+        self.news_loading_modes.add(mode)
         self.news_loading = True
         if self.current_section == "news":
-            self.show_news_loading("正在获取 AI HOT 今日日报……")
+            self.show_news_loading("正在获取免费模型快讯……" if is_flash
+                                   else "正在获取 AI HOT 今日日报……")
 
         def worker():
             try:
-                payload, error = fetch_daily(), None
+                payload, error = (fetch_free_model_digest() if is_flash else fetch_daily()), None
                 if payload.get("date") != target_date:
-                    payload, error = None, f"AI HOT 尚未发布 {target_date} 日报"
+                    label = "免费模型快讯" if is_flash else "AI HOT 日报"
+                    payload, error = None, f"{label}尚未发布 {target_date} 内容"
             except NewsServiceError as exc:
                 payload, error = None, str(exc)
             except Exception:
                 payload, error = None, "获取日报时发生未知错误"
-            self.news_results.put((payload, error))
+            self.news_results.put((mode, payload, error))
 
         threading.Thread(target=worker, name="aihot-daily", daemon=True).start()
         if not self.news_poll_job:
@@ -2671,31 +2732,42 @@ class StickyNotesApp:
     def poll_news_results(self):
         self.news_poll_job = None
         try:
-            payload, error = self.news_results.get_nowait()
+            mode, payload, error = self.news_results.get_nowait()
         except queue.Empty:
             if self.news_loading and not self.exiting:
                 self.news_poll_job = self.root.after(80, self.poll_news_results)
             return
-        self.finish_news_load(payload, error)
+        self.finish_news_load(mode, payload, error)
+        if self.news_loading_modes and not self.news_poll_job:
+            self.news_poll_job = self.root.after(80, self.poll_news_results)
 
-    def finish_news_load(self, payload, error):
-        self.news_loading = False
+    def finish_news_load(self, mode, payload, error):
+        self.news_loading_modes.discard(mode)
+        self.news_loading = bool(self.news_loading_modes)
+        is_flash = mode == "flash"
+        cache_path = self.flash_cache_path if is_flash else self.news_cache_path
         if payload:
-            self.news_cache = payload
+            if is_flash:
+                self.flash_cache = payload
+            else:
+                self.news_cache = payload
             try:
-                save_daily_cache(self.news_cache_path, payload)
+                save_daily_cache(cache_path, payload)
             except OSError:
                 pass
-            if self.current_section == "news":
+            if self.current_section == "news" and self.news_mode == mode:
                 self.apply_news_payload(payload)
             return
-        if self.current_section == "news":
-            if self.news_cache:
-                self.apply_news_payload(self.news_cache)
-                cached_date = self.news_cache.get("date", "未知日期")
+        cache = self.flash_cache if is_flash else self.news_cache
+        if self.current_section == "news" and self.news_mode == mode:
+            if cache:
+                self.apply_news_payload(cache)
+                cached_date = cache.get("date", "未知日期")
                 self.status_var.set(f"联网失败，正在展示 {cached_date} 的本地缓存")
             else:
-                self.show_news_loading(error or "暂时无法获取 AI HOT 日报")
+                fallback_message = ("暂时无法获取免费模型快讯" if is_flash
+                                    else "暂时无法获取 AI HOT 日报")
+                self.show_news_loading(error or fallback_message)
 
     def apply_news_payload(self, payload):
         selected_permalink = ((self.current_news or {}).get("permalink") or
@@ -2713,7 +2785,7 @@ class StickyNotesApp:
     def show_news_loading(self, message):
         self.current_news = None
         self.editor.configure(state="normal")
-        self.news_title_var.set("AI HOT 日报")
+        self.news_title_var.set("免费模型快讯" if self.news_mode == "flash" else "AI HOT 日报")
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", message)
         self.editor.edit_modified(False)
@@ -2728,12 +2800,22 @@ class StickyNotesApp:
         self.current_news = item
         self.current = None
         self.current_reminder = None
-        report_date = (self.news_cache or {}).get("date", "")
-        detail = (f"{item.get('category', '其他')} · {report_date}\n"
-                  f"来源：{item.get('source_name', 'AI HOT')}\n\n"
-                  f"{item.get('summary', '')}\n\n"
-                  f"AI HOT：{item.get('permalink', '')}\n"
-                  f"原文：{item.get('source_url', '')}")
+        report_date = (self.active_news_cache() or {}).get("date", "")
+        if self.news_mode == "flash":
+            detail = (f"{item.get('category', '其他模型')} · {report_date}\n"
+                      f"免费方式：{item.get('free_type') or '待核验'}\n"
+                      f"使用方式：{item.get('access_type') or '见来源页'}\n"
+                      f"模型：{item.get('model_id') or item.get('title', '')}\n"
+                      f"截止：{item.get('expires_at') or '未公布'}\n"
+                      f"状态：{item.get('status') or '待核验'} · 可信度：{item.get('confidence') or '未知'}\n\n"
+                      f"{item.get('summary', '')}\n\n来源：{item.get('source_name', '公开来源')}\n"
+                      f"链接：{item.get('source_url', '')}")
+        else:
+            detail = (f"{item.get('category', '其他')} · {report_date}\n"
+                      f"来源：{item.get('source_name', 'AI HOT')}\n\n"
+                      f"{item.get('summary', '')}\n\n"
+                      f"AI HOT：{item.get('permalink', '')}\n"
+                      f"原文：{item.get('source_url', '')}")
         self.editor.configure(state="normal")
         self.news_title_var.set(item.get("title", "未命名新闻"))
         self.editor.delete("1.0", "end")
@@ -2744,8 +2826,9 @@ class StickyNotesApp:
         self.refresh_list()
 
     def open_news_home(self):
-        webbrowser.open((self.news_cache or {}).get("canonical") or
-                        "https://aihot.virxact.com/daily")
+        fallback = ("https://github.com/zhulvglos/QINGJIAN/releases/tag/free-model-daily"
+                    if self.news_mode == "flash" else "https://aihot.virxact.com/daily")
+        webbrowser.open((self.active_news_cache() or {}).get("canonical") or fallback)
 
     def open_news_source(self):
         if self.current_news and self.current_news.get("source_url"):
@@ -2789,7 +2872,13 @@ class StickyNotesApp:
         self.apply_theme(save=False)
         self.refresh_list()
         if section == "news":
-            self.show_news_loading("正在获取 AI HOT 今日日报……")
+            self.news_tabs_frame.pack(fill="x", after=self.toolbar)
+            self.body.pack_forget()
+            self.body.pack(fill="both", expand=True, padx=8, pady=8,
+                           after=self.news_tabs_frame)
+            self.update_news_tabs()
+            self.show_news_loading("正在读取免费模型快讯……" if self.news_mode == "flash"
+                                   else "正在获取 AI HOT 今日日报……")
             self.load_news(False)
             return
         if not select_default:
