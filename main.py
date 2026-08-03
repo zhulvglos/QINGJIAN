@@ -359,6 +359,7 @@ class StickyNotesApp:
         self.edge_controller.visible_size = max(
             self.HIDDEN_SIZE, round(self.HIDDEN_SIZE * scale))
         self.root.after_idle(self.refresh_quick_rail)
+        self.root.after_idle(self.enforce_news_clean_layout)
 
     def _build_ui(self):
         style = ttk.Style()
@@ -1307,6 +1308,7 @@ class StickyNotesApp:
             self.position_compact_sash()
         else:
             self.position_wide_sash()
+        self.enforce_news_clean_layout()
 
     def schedule_responsive_layout(self, _event=None):
         if self.layout_job:
@@ -1334,6 +1336,16 @@ class StickyNotesApp:
             if not self.title_entry.winfo_manager():
                 self.title_entry.pack(fill="x", padx=10, pady=(10, 5),
                                       before=self.editor)
+
+    def enforce_news_clean_layout(self):
+        """新闻板块只保留新闻控件，防止异步或跨屏布局恢复旧编辑控件。"""
+        if self.current_section != "news":
+            return
+        for widget in (self.title_entry, self.reminder_frame, self.reminder_hint,
+                       self.reminder_actions, self.learning_actions,
+                       self.note_filter_frame, self.ai_interview_frame):
+            widget.pack_forget()
+        self.show_news_title(True)
 
     def apply_theme(self, save=True):
         self.colors = THEMES[self.theme_name]
@@ -2698,6 +2710,7 @@ class StickyNotesApp:
         self.news_items = []
         self.listbox.delete(0, "end")
         self.update_news_tabs()
+        self.enforce_news_clean_layout()
         self.update_toolbar_labels()
         self.show_news_loading("正在读取免费模型快讯……" if mode == "flash"
                                else "正在获取 AI HOT 今日日报……")
@@ -2790,6 +2803,7 @@ class StickyNotesApp:
                 self.show_news_loading(error or fallback_message)
 
     def apply_news_payload(self, payload):
+        self.enforce_news_clean_layout()
         selected_permalink = ((self.current_news or {}).get("permalink") or
                               self.section_selection_ids.get("news"))
         self.news_items = list(payload.get("items") or [])
@@ -2803,6 +2817,7 @@ class StickyNotesApp:
             self.show_news_loading("今日暂无新闻")
 
     def show_news_loading(self, message):
+        self.enforce_news_clean_layout()
         self.current_news = None
         self.editor.configure(state="normal")
         self.news_title_var.set("免费模型快讯" if self.news_mode == "flash" else "AI HOT 日报")
@@ -2846,6 +2861,7 @@ class StickyNotesApp:
         self.editor.configure(state="disabled")
         self.news_source_button.state(["!disabled"] if item.get("source_url") else ["disabled"])
         self.refresh_list()
+        self.enforce_news_clean_layout()
 
     def open_news_home(self):
         fallback = ("https://github.com/zhulvglos/QINGJIAN/releases/tag/free-model-daily"
@@ -2899,6 +2915,7 @@ class StickyNotesApp:
             self.body.pack(fill="both", expand=True, padx=8, pady=8,
                            after=self.news_tabs_frame)
             self.update_news_tabs()
+            self.enforce_news_clean_layout()
             self.show_news_loading("正在读取免费模型快讯……" if self.news_mode == "flash"
                                    else "正在获取 AI HOT 今日日报……")
             self.load_news(False)

@@ -61,6 +61,34 @@ class FreeModelServiceTests(unittest.TestCase):
         self.assertEqual(app.news_daily_tab.states[-1], ["selected"])
         self.assertEqual(app.news_flash_tab.states[-1], ["!selected"])
 
+    def test_news_layout_hides_all_non_news_controls(self):
+        class FakeWidget:
+            def __init__(self):
+                self.hidden = 0
+
+            def pack_forget(self):
+                self.hidden += 1
+
+        app = StickyNotesApp.__new__(StickyNotesApp)
+        app.current_section = "news"
+        names = ("title_entry", "reminder_frame", "reminder_hint", "reminder_actions",
+                 "learning_actions", "note_filter_frame", "ai_interview_frame")
+        widgets = []
+        for name in names:
+            widget = FakeWidget()
+            setattr(app, name, widget)
+            widgets.append(widget)
+        calls = []
+        app.show_news_title = calls.append
+        app.enforce_news_clean_layout()
+        self.assertTrue(all(widget.hidden == 1 for widget in widgets))
+        self.assertEqual(calls, [True])
+
+    def test_non_news_layout_is_not_changed(self):
+        app = StickyNotesApp.__new__(StickyNotesApp)
+        app.current_section = "journal"
+        app.enforce_news_clean_layout()
+
 
 if __name__ == "__main__":
     unittest.main()
