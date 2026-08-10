@@ -1,5 +1,6 @@
 """生成免费模型每日快讯。只依赖标准库，供 GitHub Actions 定时执行。"""
 import argparse
+import html
 import json
 import os
 import re
@@ -153,12 +154,63 @@ def siliconflow_items(now):
     return results[:20]
 
 
+def siliconflow_public_items(now):
+    """从硅基流动公开模型页读取免费或部分免费的 API 模型。
+
+    模型目录 API 不一定返回活动额度或价格字段，因此这里补充公开页面核验。
+    输入或输出任一侧为 0 即纳入，但在免费方式中明确标注另一侧是否收费，
+    避免把“部分免费”误报成永久免费。
+    """
+    url = os.getenv("SILICONFLOW_PUBLIC_MODELS_URL", "https://www.siliconflow.cn/models")
+    request = Request(url, headers={"User-Agent": UA, "Accept": "text/html"})
+    with urlopen(request, timeout=25) as response:
+        page = html.unescape(response.read().decode("utf-8", errors="replace"))
+    results = []
+    marker = '<div class="mb-[14px] group-hover:hidden">'
+    for card in page.split(marker)[1:]:
+        name_match = re.search(
+            r'<div class="text-slate-800 text-\[16px\] font-semibold truncate mb-\[4px\]">\s*([^<]+)', card)
+        if not name_match:
+            continue
+        model_id = re.sub(r"\s+", " ", name_match.group(1)).strip()
+        price_match = re.search(
+            r"输入:\s*<span[^>]*>￥\s*(?:<!--.*?-->)?\s*([\d.]+).*?输出:\s*<span[^>]*>￥\s*(?:<!--.*?-->)?\s*([\d.]+)",
+            card, re.S)
+        if not price_match or all(float(value) != 0 for value in price_match.groups()):
+            continue
+        input_price, output_price = (float(value) for value in price_match.groups())
+        desc_match = re.search(
+            r'<div class="text-slate-800 text-\[14px\] line-clamp-2 mb-\[8px\]">\s*(.*?)</div>',
+            card, re.S)
+        description = re.sub(r"<[^>]+>", "", desc_match.group(1)).strip() if desc_match else ""
+        category_match = re.search(r'ant-tag-blue[^>]*>\s*([^<]+)', card)
+        category_text = category_match.group(1).strip() if category_match else "对话"
+        category = "VLM" if any(word in category_text for word in ("视觉", "图像")) else "LLM"
+        model = {"id": model_id, "name": model_id, "description": description}
+        features, use_cases, summary = describe_model(model, category)
+        results.append({
+            "category": category, "title": model_id,
+            "summary": summary or description[:500] or "硅基流动公开页面标记为零价格 API。",
+            "features": features, "use_cases": use_cases,
+            "source_name": "硅基流动", "source_url": url,
+            "permalink": f"siliconflow-public:{model_id}",
+            "free_type": ("当前免费 API（输入/输出均为 0）" if input_price == output_price == 0
+                          else f"部分免费 API（输入 ￥{input_price:g}/M，输出 ￥{output_price:g}/M）"),
+            "access_type": "在线 API", "model_id": model_id,
+            "expires_at": "官方未公布截止日期，可能随时调整",
+            "verified_at": now.isoformat(timespec="seconds"), "confidence": "高",
+            "status": "已核验公开模型页价格；免费侧可能随时调整",
+        })
+    return results[:20]
+
+
 def build_digest():
     now = datetime.now(TZ)
     items, errors = [], []
     collectors = [("OpenRouter", openrouter_items)]
     if os.getenv("SILICONFLOW_API_KEY", "").strip():
         collectors.append(("硅基流动", siliconflow_items))
+    collectors.append(("硅基流动公开模型页", siliconflow_public_items))
     for name, collector in collectors:
         try:
             items.extend(collector(now))

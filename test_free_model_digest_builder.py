@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from scripts.build_free_model_digest import openrouter_items, siliconflow_items
+from scripts.build_free_model_digest import openrouter_items, siliconflow_items, siliconflow_public_items
 
 
 class FreeModelDigestBuilderTests(unittest.TestCase):
@@ -78,6 +78,18 @@ class FreeModelDigestBuilderTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["source_name"], "硅基流动")
         self.assertEqual(items[0]["access_type"], "在线 API")
+
+    @patch("scripts.build_free_model_digest.urlopen")
+    def test_collects_zero_price_models_from_siliconflow_public_page(self, urlopen):
+        from io import BytesIO
+        page = '''<div class="mb-[14px] group-hover:hidden"><div class="text-slate-800 text-[16px] font-semibold truncate mb-[4px]">Qwen/Qwen-Free</div><div class="mb-[12px] hidden group-hover:block"><div class="text-slate-800 text-[14px] line-clamp-2 mb-[8px]">Chinese reasoning model for coding.</div></div><div>输入: <span class="text-primary">￥<!-- -->0</span> / M Tokens</div><div>输出: <span class="text-primary">￥<!-- -->0</span> / M Tokens</div>'''.encode()
+        class Response(BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+        urlopen.return_value = Response(page)
+        items = siliconflow_public_items(datetime.now(timezone.utc))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["source_name"], "硅基流动")
 
 
 if __name__ == "__main__":
