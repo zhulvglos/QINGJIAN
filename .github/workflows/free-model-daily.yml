@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build daily digest
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
         run: python scripts/build_free_model_digest.py --output "$RUNNER_TEMP/daily.json"
       - name: Replace fixed data branch
         env:

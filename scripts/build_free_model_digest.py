@@ -1,6 +1,7 @@
 """生成免费模型每日快讯。只依赖标准库，供 GitHub Actions 定时执行。"""
 import argparse
 import json
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -9,8 +10,10 @@ from urllib.request import Request, urlopen
 
 TZ = timezone(timedelta(hours=8))
 UA = "Qingjian-Free-Model-Digest/1.0"
-def get_json(url, timeout=25):
-    request = Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+def get_json(url, timeout=25, headers=None):
+    request_headers = {"User-Agent": UA, "Accept": "application/json"}
+    request_headers.update(headers or {})
+    request = Request(url, headers=request_headers)
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -108,10 +111,55 @@ def openrouter_items(now):
     return results[:20]
 
 
+def siliconflow_items(now):
+    """读取硅基流动的 OpenAI 兼容模型目录，只保留明确为零价的 API。
+
+    该接口需要用户在 GitHub Actions 中配置 SILICONFLOW_API_KEY；未配置时跳过，
+    避免把无法核验的模型误报为免费。
+    """
+    api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
+    if not api_key:
+        return []
+    url = os.getenv("SILICONFLOW_MODELS_URL", "https://api.siliconflow.cn/v1/models")
+    payload = get_json(url, headers={"Authorization": f"Bearer {api_key}"})
+    results = []
+    for model in payload.get("data") or []:
+        model_id = str(model.get("id") or "")
+        pricing = model.get("pricing") or model.get("price") or {}
+        prompt = pricing.get("prompt", pricing.get("input", pricing.get("input_price")))
+        completion = pricing.get("completion", pricing.get("output", pricing.get("output_price")))
+        zero = prompt is not None and completion is not None and all(
+            str(value) in ("0", "0.0", "0.00") for value in (prompt, completion))
+        if not model_id or not zero:
+            continue
+        architecture = model.get("architecture") or {}
+        inputs = architecture.get("input_modalities") or []
+        category = "VLM" if "image" in inputs else "LLM"
+        description = str(model.get("description") or model.get("name") or model_id).strip()
+        if len(description) < 20:
+            description = f"硅基流动目录中的 {model_id}，当前返回零价格 API 字段。"
+        features, use_cases, short_description = describe_model(model, category)
+        results.append({
+            "category": category, "title": str(model.get("name") or model_id),
+            "summary": short_description or description[:500],
+            "features": features, "use_cases": use_cases,
+            "source_name": "硅基流动", "source_url": "https://www.siliconflow.cn/models",
+            "permalink": f"siliconflow:{model_id}", "free_type": "当前免费 API（以平台额度为准）",
+            "access_type": "在线 API", "model_id": model_id,
+            "expires_at": "官方未公布截止日期，可能随时调整",
+            "verified_at": now.isoformat(timespec="seconds"), "confidence": "中",
+            "status": "已核验目录零价格字段",
+        })
+    return results[:20]
+
+
 def build_digest():
     now = datetime.now(TZ)
     items, errors = [], []
-    for name, collector in (("OpenRouter", openrouter_items),):
+    collectors = [("OpenRouter", openrouter_items)]
+    if os.getenv("SILICONFLOW_API_KEY", "").strip():
+        collectors.append(("硅基流动", siliconflow_items))
+    for name, collector in collectors:
         try:
             items.extend(collector(now))
         except Exception as exc:
@@ -129,7 +177,7 @@ def build_digest():
     return {
         "date": now.date().isoformat(), "generated_at": now.isoformat(timespec="seconds"),
         "canonical": "https://github.com/zhulvglos/QINGJIAN/releases/tag/free-model-daily",
-        "source": "OpenRouter 在线免费 API", "summary": summary,
+        "source": "OpenRouter 与已配置的国内在线 API 来源", "summary": summary,
         "errors": errors, "items": items,
     }
 

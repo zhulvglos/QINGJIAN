@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from scripts.build_free_model_digest import openrouter_items
+from scripts.build_free_model_digest import openrouter_items, siliconflow_items
 
 
 class FreeModelDigestBuilderTests(unittest.TestCase):
@@ -63,6 +63,21 @@ class FreeModelDigestBuilderTests(unittest.TestCase):
             "architecture": {"input_modalities": ["text"]},
         }]}
         self.assertEqual(openrouter_items(datetime.now(timezone.utc)), [])
+
+    @patch.dict("os.environ", {"SILICONFLOW_API_KEY": "test-key"})
+    @patch("scripts.build_free_model_digest.get_json")
+    def test_collects_only_zero_price_siliconflow_models(self, get_json):
+        get_json.return_value = {"data": [
+            {"id": "Qwen/Qwen3-8B", "name": "Qwen3-8B",
+             "description": "Reasoning and coding model for Chinese applications.",
+             "pricing": {"prompt": "0", "completion": "0"},
+             "architecture": {"input_modalities": ["text"]}},
+            {"id": "DeepSeek/paid", "pricing": {"prompt": "0.2", "completion": "0.4"}},
+        ]}
+        items = siliconflow_items(datetime.now(timezone.utc))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["source_name"], "硅基流动")
+        self.assertEqual(items[0]["access_type"], "在线 API")
 
 
 if __name__ == "__main__":
