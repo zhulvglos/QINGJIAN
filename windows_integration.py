@@ -10,6 +10,15 @@ from pathlib import Path
 
 AUTOSTART_NAME = "LightNote"
 CREDENTIAL_TARGET = "LightNote.AI.APIKey"
+CREDENTIAL_TARGETS = {
+    "step_plan": CREDENTIAL_TARGET,
+    "llama_cpp": "LightNote.AI.APIKey.llama_cpp",
+    "custom": "LightNote.AI.APIKey.custom",
+}
+
+
+def _credential_target(provider: str = "step_plan") -> str:
+    return CREDENTIAL_TARGETS.get(provider, CREDENTIAL_TARGETS["custom"])
 
 
 class _CREDENTIALW(ctypes.Structure):
@@ -24,7 +33,7 @@ class _CREDENTIALW(ctypes.Structure):
     ]
 
 
-def save_ai_token(token: str) -> bool:
+def save_ai_token(token: str, provider: str = "step_plan") -> bool:
     """将Token保存到当前用户的Windows凭据管理器。"""
     token = token.strip()
     if not token or os.name != "nt":
@@ -34,7 +43,7 @@ def save_ai_token(token: str) -> bool:
         blob = (ctypes.c_ubyte * len(encoded)).from_buffer_copy(encoded)
         credential = _CREDENTIALW()
         credential.Type = 1  # CRED_TYPE_GENERIC
-        credential.TargetName = CREDENTIAL_TARGET
+        credential.TargetName = _credential_target(provider)
         credential.CredentialBlobSize = len(encoded)
         credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
         credential.Persist = 2  # CRED_PERSIST_LOCAL_MACHINE
@@ -44,13 +53,13 @@ def save_ai_token(token: str) -> bool:
         return False
 
 
-def load_ai_token() -> str:
+def load_ai_token(provider: str = "step_plan") -> str:
     if os.name != "nt":
         return ""
     pointer = ctypes.POINTER(_CREDENTIALW)()
     try:
         if not ctypes.windll.advapi32.CredReadW(
-                CREDENTIAL_TARGET, 1, 0, ctypes.byref(pointer)):
+                _credential_target(provider), 1, 0, ctypes.byref(pointer)):
             return ""
         credential = pointer.contents
         raw = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)

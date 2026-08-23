@@ -177,6 +177,13 @@ def _wav_has_frames(path: Path) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class MeetingUtteranceChunk:
+    audio: bytes
+    is_final: bool
+    reason: str
+
+
 class MeetingUtteranceSegmenter:
     """低延迟本地端点检测：说话后遇到停顿即输出完整PCM语句。"""
 
@@ -208,7 +215,7 @@ class MeetingUtteranceSegmenter:
             self._noise_floor = self._noise_floor * 0.95 + level * 0.05
         return voiced
 
-    def feed(self, raw: bytes) -> List[bytes]:
+    def feed_events(self, raw: bytes) -> List[MeetingUtteranceChunk]:
         self._pending += raw or b""
         completed = []
         while len(self._pending) >= self.frame_bytes:
@@ -233,19 +240,25 @@ class MeetingUtteranceSegmenter:
                 self._silent_run += 1
             if self._silent_run >= self.silence_frames:
                 if self._voiced_frames >= 3:
-                    completed.append(bytes(self._utterance))
+                    completed.append(MeetingUtteranceChunk(
+                        bytes(self._utterance), True, "silence"))
                 self._active = False
                 self._utterance.clear()
                 self._silent_run = 0
                 self._voiced_frames = 0
                 continue
             if len(self._utterance) >= self.max_bytes:
-                completed.append(bytes(self._utterance))
+                completed.append(MeetingUtteranceChunk(
+                    bytes(self._utterance), False, "max_duration"))
                 overlap = bytes(self._utterance[-self.overlap_bytes:])
                 self._utterance = bytearray(overlap)
                 self._silent_run = 0
                 self._voiced_frames = max(1, len(overlap) // self.frame_bytes)
         return completed
+
+    def feed(self, raw: bytes) -> List[bytes]:
+        """兼容旧调用；新实时链路使用 feed_events 获取结束原因。"""
+        return [chunk.audio for chunk in self.feed_events(raw)]
 
 
 class DualTrackRecorder:
@@ -344,17 +357,23 @@ class DualTrackRecorder:
         return raw, start_byte + len(raw)
 
     def write_live_meeting_chunk(self, raw: bytes, sequence: int) -> Path:
-        """把VAD确认的一段PCM写成临时WAV，供在线或本地ASR识别。"""
+        """把会议PCM统一为16kHz单声道WAV，供在线或本地ASR识别。"""
         if not raw or not self.system_path:
             raise VoiceServiceError("没有可识别的会议方音频")
+        pcm = raw
+        if self.system_channels > 1:
+            pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+        if self.system_rate != 16000:
+            pcm, _state = audioop.ratecv(
+                pcm, 2, 1, self.system_rate, 16000, None)
         chunk_dir = self.system_path.parent / "live_chunks"
         chunk_dir.mkdir(exist_ok=True)
         chunk_path = chunk_dir / f"utterance_{sequence:06d}.wav"
         with wave.open(str(chunk_path), "wb") as audio:
-            audio.setnchannels(self.system_channels)
+            audio.setnchannels(1)
             audio.setsampwidth(2)
-            audio.setframerate(self.system_rate)
-            audio.writeframes(raw)
+            audio.setframerate(16000)
+            audio.writeframes(pcm)
         return chunk_path
 
     def start(self, microphone: Dict, output: Dict) -> None:

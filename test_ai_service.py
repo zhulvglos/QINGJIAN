@@ -6,14 +6,31 @@ from unittest.mock import patch
 from ai_service import (AIServiceError, MEETING_TASKS, REASONING_EFFORTS,
                         STEP_PLAN_MODELS, ai_provider, analyze_meeting,
                         answer_interview_question, chat_url,
+                        choose_interview_answer_provider,
                         chunk_interview_text, parse_sse_lines,
                         stream_chat_completion, strip_thinking)
 
 
 class AIServiceTests(unittest.TestCase):
+    def test_interview_answer_provider_routes_by_mode_and_risk(self):
+        self.assertEqual(choose_interview_answer_provider(
+            "local_fast", {}, ["terms.md"])[0], "llama_cpp")
+        self.assertEqual(choose_interview_answer_provider(
+            "cloud_quality", {}, ["terms.md"])[0], "step_plan")
+        self.assertEqual(choose_interview_answer_provider(
+            "hybrid", {"correction_applied": True}, ["terms.md"])[0], "step_plan")
+        self.assertEqual(choose_interview_answer_provider(
+            "hybrid", {}, ["terms.md"])[0], "llama_cpp")
+        self.assertEqual(choose_interview_answer_provider(
+            "hybrid", {"unknown_acronyms": ["ABC"]}, ["terms.md"])[0], "step_plan")
+        self.assertEqual(choose_interview_answer_provider(
+            "hybrid", {}, [])[0], "step_plan")
+
     def test_step_plan_provider_and_catalog(self):
         self.assertEqual(
             ai_provider("https://api.stepfun.com/step_plan/v1"), "step_plan")
+        self.assertEqual(ai_provider("http://127.0.0.1:8080/v1"), "llama_cpp")
+        self.assertEqual(ai_provider("http://localhost:8080/v1/"), "llama_cpp")
         self.assertEqual(ai_provider("https://example.test/v1"), "custom")
         self.assertEqual(
             list(STEP_PLAN_MODELS),
@@ -107,12 +124,134 @@ class AIServiceTests(unittest.TestCase):
 
         with patch("ai_service.urlopen", side_effect=fake_urlopen):
             self.assertEqual(stream_chat_completion(
-                config, [{"role": "user", "content": "测试"}], max_tokens=64), "完成")
+                config, [{"role": "user", "content": "测试"}], max_tokens=64,
+                disable_thinking=True), "完成")
         self.assertEqual(
             captured["url"],
             "https://api.stepfun.com/step_plan/v1/chat/completions")
         self.assertEqual(captured["body"]["model"], "step-3.5-flash")
         self.assertEqual(captured["body"]["reasoning_effort"], "low")
+        self.assertNotIn("chat_template_kwargs", captured["body"])
+
+    def test_local_llama_request_disables_thinking_when_requested(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                payload = json.dumps({"choices": [{"delta": {"content": "完成"}}]})
+                return iter([f"data: {payload}\n".encode(), b"data: [DONE]\n"])
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["headers"] = dict(request.header_items())
+            return FakeResponse()
+
+        config = {
+            "base_url": "http://127.0.0.1:8080/v1",
+            "model": "qwen3-8b-local",
+            "reasoning_effort": "high",
+            "api_key": "local-llama",
+        }
+        with patch("ai_service.urlopen", side_effect=fake_urlopen):
+            self.assertEqual(stream_chat_completion(
+                config, [{"role": "user", "content": "测试"}], max_tokens=64,
+                disable_thinking=True), "完成")
+        self.assertEqual(
+            captured["url"], "http://127.0.0.1:8080/v1/chat/completions")
+        self.assertEqual(
+            captured["body"]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertNotIn("reasoning_effort", captured["body"])
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer local-llama")
+
+    def test_answer_interview_question_disables_thinking_for_local_llama(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                payload = json.dumps({"choices": [{"delta": {"content": "直接回答"}}]})
+                return iter([f"data: {payload}\n".encode(), b"data: [DONE]\n"])
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        config = {"base_url": "http://127.0.0.1:8080/v1",
+                  "model": "qwen3-8b-local", "reasoning_effort": "high",
+                  "api_key": "local-llama"}
+        with patch("ai_service.urlopen", side_effect=fake_urlopen):
+            result = answer_interview_question(
+                "如何推进项目？", "刚才讨论项目交付", "", config)
+        self.assertEqual(result, "直接回答")
+        self.assertEqual(
+            captured["body"]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertNotIn("reasoning_effort", captured["body"])
+
+    def test_analyze_meeting_keeps_default_thinking_for_local_llama(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                payload = json.dumps({"choices": [{"delta": {"content": "会议纪要"}}]})
+                return iter([f"data: {payload}\n".encode(), b"data: [DONE]\n"])
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        config = {"base_url": "http://127.0.0.1:8080/v1",
+                  "model": "qwen3-8b-local", "reasoning_effort": "high",
+                  "api_key": "local-llama"}
+        with patch("ai_service.urlopen", side_effect=fake_urlopen):
+            result = analyze_meeting("minutes", "会议方1：确定下周评审。", config)
+        self.assertEqual(result, "会议纪要")
+        self.assertNotIn("chat_template_kwargs", captured["body"])
+        self.assertNotIn("reasoning_effort", captured["body"])
+
+    def test_completion_accepts_json_mode_and_low_temperature(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                payload = json.dumps({"choices": [{"delta": {"content": '{"items":[]}'}}]})
+                return iter([f"data: {payload}\n".encode(), b"data: [DONE]\n"])
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured.update(json.loads(request.data.decode("utf-8")))
+            return FakeResponse()
+
+        config = {"base_url": "https://example.test/v1", "model": "test-model",
+                  "api_key": "test-token"}
+        with patch("ai_service.urlopen", side_effect=fake_urlopen):
+            stream_chat_completion(
+                config, [{"role": "user", "content": "测试"}],
+                response_format={"type": "json_object"}, temperature=0.1)
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["temperature"], 0.1)
 
     def test_empty_final_answer_retries_without_token_cap(self):
         class FakeResponse:
@@ -150,6 +289,28 @@ class AIServiceTests(unittest.TestCase):
         self.assertNotIn("max_tokens", bodies[0])
         self.assertIn("立即直接输出", bodies[1]["messages"][-1]["content"])
 
+    def test_empty_final_answer_error_is_provider_neutral(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                payload = json.dumps({"choices": [{
+                    "delta": {"reasoning_content": "内部分析"},
+                    "finish_reason": "length",
+                }]})
+                return iter([f"data: {payload}\n".encode(), b"data: [DONE]\n"])
+
+        config = {"base_url": "https://example.test/v1", "model": "test-model",
+                  "api_key": "test-token"}
+        with patch("ai_service.urlopen", return_value=FakeResponse()):
+            with self.assertRaisesRegex(AIServiceError, "AI服务未返回最终答案") as context:
+                stream_chat_completion(config, [{"role": "user", "content": "问题"}])
+        self.assertNotIn("Step", str(context.exception))
+
     def test_meeting_minutes_template_requires_actions_and_no_fabrication(self):
         instruction = MEETING_TASKS["minutes"][1]
         self.assertIn("行动项表格", instruction)
@@ -178,6 +339,7 @@ class AIServiceTests(unittest.TestCase):
         self.assertIn("只输出一段自然、简洁", prompt)
         self.assertIn("100至250个汉字", prompt)
         self.assertIn("一般知识和技术问题", prompt)
+        self.assertIn("绝不能猜测缩写全称", prompt)
         self.assertNotIn("先给出30至60秒", prompt)
         self.assertIsNone(mocked.call_args.kwargs["max_tokens"])
         self.assertTrue(mocked.call_args.kwargs["retry_empty"])

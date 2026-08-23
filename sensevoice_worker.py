@@ -21,17 +21,23 @@ def _clean_text(text):
     return OpenCC("t2s").convert(cleaned).strip()
 
 
-def _build_model():
+def _build_model(live=False):
     from funasr import AutoModel
 
-    return AutoModel(
-        model=str(RUNTIME_ROOT / "models" / "SenseVoiceSmall"),
-        vad_model=str(RUNTIME_ROOT / "models" / "fsmn-vad"),
-        spk_model=str(RUNTIME_ROOT / "models" / "campplus-speaker"),
-        vad_kwargs={"max_single_segment_time": 15000},
-        device="cpu",
-        disable_update=True,
-    )
+    options = {
+        "model": str(RUNTIME_ROOT / "models" / "SenseVoiceSmall"),
+        "device": "cpu",
+        "disable_update": True,
+    }
+    if live:
+        options["disable_pbar"] = True
+    if not live:
+        options.update({
+            "vad_model": str(RUNTIME_ROOT / "models" / "fsmn-vad"),
+            "spk_model": str(RUNTIME_ROOT / "models" / "campplus-speaker"),
+            "vad_kwargs": {"max_single_segment_time": 15000},
+        })
+    return AutoModel(**options)
 
 
 def _segments_from_result(result, default_speaker, diarize):
@@ -68,10 +74,12 @@ def _segments_from_result(result, default_speaker, diarize):
 def transcribe(request, model=None):
     model = model or _build_model()
     all_segments = []
+    return_speakers = any(
+        bool(track.get("diarize")) for track in request.get("tracks", []))
     for track in request.get("tracks", []):
         result = model.generate(
             input=str(track["path"]), cache={}, language="zh", use_itn=True,
-            batch_size_s=60, merge_vad=False, return_spk_res=True,
+            batch_size_s=60, merge_vad=False, return_spk_res=return_speakers,
         )
         all_segments.extend(_segments_from_result(
             result, track.get("label", "说话人"), bool(track.get("diarize"))))
@@ -80,7 +88,7 @@ def transcribe(request, model=None):
 
 def serve():
     """JSON Lines 常驻模式，供准实时提问检测复用同一个模型实例。"""
-    model = _build_model()
+    model = _build_model(live=True)
     print(json.dumps({"event": "ready"}, ensure_ascii=False), flush=True)
     for line in iter(input, ""):
         try:

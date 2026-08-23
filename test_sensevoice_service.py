@@ -1,11 +1,14 @@
 import json
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sensevoice_service import SenseVoiceTranscriber
+import sensevoice_worker
+from sensevoice_service import SenseVoiceLiveSession, SenseVoiceTranscriber
+from voice_service import VoiceServiceError
 
 
 class SenseVoiceServiceTests(unittest.TestCase):
@@ -54,6 +57,37 @@ class SenseVoiceServiceTests(unittest.TestCase):
         tracks = mocked.call_args.args[0]
         self.assertEqual(tracks[0], (Path("mic.wav"), "我", False))
         self.assertEqual(tracks[1], (Path("meeting.wav"), "会议方", True))
+
+    def test_live_reader_ignores_logs_and_returns_ready_event(self):
+        session = SenseVoiceLiveSession(Path("D:/unused"))
+        session.process = object()
+        session._output_queue.put("loading model\n")
+        session._output_queue.put('{"event": "ready"}\n')
+        self.assertEqual(
+            session._read_json_response(0.1, "模型启动")["event"], "ready")
+
+    def test_live_reader_applies_startup_timeout(self):
+        session = SenseVoiceLiveSession(Path("D:/unused"))
+        session.process = object()
+        with self.assertRaisesRegex(VoiceServiceError, "模型启动超过"):
+            session._read_json_response(0.01, "模型启动")
+
+    def test_live_worker_only_loads_sensevoice_model(self):
+        calls = []
+
+        def fake_auto_model(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        fake_funasr = types.SimpleNamespace(AutoModel=fake_auto_model)
+        with patch.dict("sys.modules", {"funasr": fake_funasr}):
+            sensevoice_worker._build_model(live=True)
+            sensevoice_worker._build_model(live=False)
+        self.assertNotIn("vad_model", calls[0])
+        self.assertNotIn("spk_model", calls[0])
+        self.assertTrue(calls[0]["disable_pbar"])
+        self.assertIn("vad_model", calls[1])
+        self.assertIn("spk_model", calls[1])
 
 
 if __name__ == "__main__":

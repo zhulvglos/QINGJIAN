@@ -9,6 +9,7 @@ QUESTION_PATTERNS = (
     r"什么", r"多少", r"是否", r"能否", r"有没有", r"是不是", r"可不可以",
     r"你认为", r"你怎么看", r"你会怎么", r"你负责", r"你的贡献",
     r"介绍一下", r"说说", r"谈谈", r"展开(?:一下)?", r"举个例子",
+    r"解释(?:一下|下)?", r"讲解(?:一下|下)?",
     r"具体(?:是|做|说|讲|负责)", r"结果怎么样", r"遇到过", r"请说明",
 )
 
@@ -59,10 +60,11 @@ def extract_questions(text: str, threshold: float = 0.48) -> List[Dict]:
 class InterviewQuestionDetector:
     """保留短时会议上下文，并过滤重复的候选提问。"""
 
-    def __init__(self, context_size: int = 10, context_seconds: float = 60.0):
+    def __init__(self, context_size: int = 10, context_seconds: float = 90.0):
         self._context = deque(maxlen=max(2, context_size))
         self.context_seconds = max(10.0, float(context_seconds))
         self._seen = deque(maxlen=20)
+        self._continued_parts = []
 
     @staticmethod
     def _remove_overlap(previous: str, current: str) -> str:
@@ -75,11 +77,16 @@ class InterviewQuestionDetector:
 
     def reset_context(self) -> None:
         self._context.clear()
+        self._continued_parts.clear()
 
-    def add_utterance(self, text: str) -> Optional[Dict]:
+    def add_utterance(self, text: str, finalize: bool = True) -> Optional[Dict]:
         cleaned = re.sub(r"\s+", " ", text or "").strip()
         if not cleaned:
-            return None
+            if not finalize or not self._continued_parts:
+                return None
+            combined = "".join(self._continued_parts).strip()
+            self._continued_parts.clear()
+            return self._candidate_from_combined(combined)
         now = time.monotonic()
         while self._context and now - self._context[0][0] > self.context_seconds:
             self._context.popleft()
@@ -88,15 +95,31 @@ class InterviewQuestionDetector:
         if not cleaned:
             return None
         self._context.append((now, cleaned))
-        candidates = extract_questions(cleaned)
+        if self._continued_parts:
+            cleaned = self._remove_overlap(self._continued_parts[-1], cleaned)
+        if cleaned:
+            self._continued_parts.append(cleaned)
+        if not finalize:
+            return None
+
+        combined = "".join(self._continued_parts).strip()
+        self._continued_parts.clear()
+        return self._candidate_from_combined(combined)
+
+    def _candidate_from_combined(self, combined: str) -> Optional[Dict]:
+        candidates = extract_questions(combined)
         if not candidates:
             return None
-        candidate = candidates[-1]
-        question = candidate["question"]
+        last_candidate = candidates[-1]
+        question = normalize_question(combined)
         fingerprint = re.sub(r"\W+", "", question).casefold()
         if not fingerprint or fingerprint in self._seen:
             return None
         self._seen.append(fingerprint)
-        context = "\n".join(item[1] for item in self._context)
-        candidate["context"] = context
+        candidate = {
+            "question": question,
+            "source": combined,
+            "confidence": last_candidate["confidence"],
+            "context": "\n".join(item[1] for item in self._context),
+        }
         return candidate

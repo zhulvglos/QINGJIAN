@@ -1,9 +1,11 @@
 import json
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -105,17 +107,43 @@ class SenseVoiceLiveSession:
     """常驻SenseVoice子进程；一次只处理一个短音频块。"""
 
     def __init__(self, runtime_root: Path = DEFAULT_RUNTIME_ROOT,
-                 startup_timeout: int = 120):
+                 startup_timeout: int = 90, response_timeout: int = 120):
         self.transcriber = SenseVoiceTranscriber(runtime_root)
         self.startup_timeout = startup_timeout
+        self.response_timeout = response_timeout
         self.process = None
         self._lock = threading.Lock()
+        self._output_queue = queue.Queue()
+        self._output_thread = None
 
-    def _read_json_response(self) -> Dict:
+    def _pump_output(self):
+        stream = self.process.stdout if self.process else None
+        try:
+            if stream:
+                for line in stream:
+                    self._output_queue.put(line)
+        finally:
+            self._output_queue.put(None)
+
+    def _read_json_response(self, timeout_seconds=None, stage="响应") -> Dict:
         logs = []
-        while self.process and self.process.stdout:
-            line = self.process.stdout.readline()
-            if not line:
+        deadline = (time.monotonic() + timeout_seconds
+                    if timeout_seconds is not None else None)
+        while self.process:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                detail = "；".join(logs[-4:])
+                raise VoiceServiceError(
+                    f"SenseVoice实时{stage}超过{timeout_seconds}秒"
+                    + (f"：{detail}" if detail else ""))
+            try:
+                line = self._output_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                detail = "；".join(logs[-4:])
+                raise VoiceServiceError(
+                    f"SenseVoice实时{stage}超过{timeout_seconds}秒"
+                    + (f"：{detail}" if detail else "")) from exc
+            if line is None:
                 break
             value = line.strip()
             try:
@@ -128,8 +156,6 @@ class SenseVoiceLiveSession:
                     "event" in payload or "ok" in payload or "error" in payload):
                 return payload
         detail = "；".join(logs[-4:])
-        if self.process and self.process.stderr:
-            detail = (detail + " " + self.process.stderr.read()[-800:]).strip()
         raise VoiceServiceError("SenseVoice实时进程没有返回有效结果：" + detail)
 
     def start(self):
@@ -152,11 +178,15 @@ class SenseVoiceLiveSession:
         self.process = subprocess.Popen(
             [str(self.transcriber.python_path), str(self.transcriber.worker_path), "--server"],
             cwd=str(runtime_root), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        self._output_queue = queue.Queue()
+        self._output_thread = threading.Thread(
+            target=self._pump_output, name="sensevoice-output-reader", daemon=True)
+        self._output_thread.start()
         try:
-            payload = self._read_json_response()
+            payload = self._read_json_response(self.startup_timeout, "模型启动")
         except Exception:
             self.close()
             raise
@@ -173,7 +203,7 @@ class SenseVoiceLiveSession:
                 raise VoiceServiceError("SenseVoice实时进程已经退出")
             self.process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
             self.process.stdin.flush()
-            response = self._read_json_response()
+            response = self._read_json_response(self.response_timeout, "识别")
         if not response.get("ok"):
             raise VoiceServiceError(response.get("error") or "SenseVoice实时转写失败")
         return list(response.get("segments") or [])

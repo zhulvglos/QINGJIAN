@@ -28,8 +28,22 @@ DEFAULT_SETTINGS = {
     "ai_base_url": STEP_PLAN_BASE_URL,
     "ai_model": STEP_PLAN_MODEL,
     "ai_reasoning_effort": "low",
+    "ai_provider_mode": "step_plan",
+    "ai_step_plan_base_url": STEP_PLAN_BASE_URL,
+    "ai_step_plan_model": STEP_PLAN_MODEL,
+    "ai_step_plan_reasoning_effort": "low",
+    "ai_llama_cpp_base_url": "http://127.0.0.1:8080/v1",
+    "ai_llama_cpp_model": "qwen3-8b-local",
+    "ai_llama_cpp_reasoning_effort": "low",
+    "llama_cpp_executable": "",
+    "llama_cpp_model_path": "",
+    "llama_cpp_autostart": False,
+    "ai_custom_base_url": "",
+    "ai_custom_model": "",
+    "ai_custom_reasoning_effort": "low",
     "ai_timeout": 180,
     "question_asr_mode": "auto",
+    "interview_answer_mode": "hybrid",
     "voice_microphone_name": "麦克风阵列 (Realtek(R) Audio)",
     "voice_output_name": "扬声器 (Realtek(R) Audio) [Loopback]",
 }
@@ -40,7 +54,7 @@ class NoteStore:
         base = Path(os.getenv("APPDATA", Path.home())) / "轻笺"
         self.path = Path(path) if path else base / "data.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.data = {"notes": [], "reminders": [], "categories": [], "quick_slots": [],
+        self.data = {"notes": [], "reminders": [], "completed_tasks": [], "categories": [], "quick_slots": [],
                      "settings": dict(DEFAULT_SETTINGS)}
         self.load()
 
@@ -53,6 +67,8 @@ class NoteStore:
                 self.data["notes"] = loaded["notes"]
             if isinstance(loaded.get("reminders"), list):
                 self.data["reminders"] = loaded["reminders"]
+            if isinstance(loaded.get("completed_tasks"), list):
+                self.data["completed_tasks"] = loaded["completed_tasks"]
             if isinstance(loaded.get("categories"), list):
                 self.data["categories"] = loaded["categories"]
             if isinstance(loaded.get("quick_slots"), list):
@@ -99,6 +115,10 @@ class NoteStore:
     def quick_slots(self) -> List[Dict]:
         return self.data["quick_slots"]
 
+    @property
+    def completed_tasks(self) -> List[Dict]:
+        return self.data["completed_tasks"]
+
     @staticmethod
     def _id() -> str:
         return str(int(datetime.now().timestamp() * 1_000_000))
@@ -114,8 +134,40 @@ class NoteStore:
         if "ai_reasoning_effort" not in self.settings:
             self.settings["ai_reasoning_effort"] = "low"
             changed = True
+        provider_mode = self.settings.get("ai_provider_mode")
+        if (self.settings.get("schema_version", 1) < 6 or
+                provider_mode not in ("step_plan", "llama_cpp", "custom")):
+            active_url = str(self.settings.get("ai_base_url") or "").lower()
+            if active_url.startswith("https://api.stepfun.com/step_plan"):
+                provider_mode = "step_plan"
+            elif active_url.startswith(("http://127.0.0.1:", "http://localhost:",
+                                        "http://[::1]:")):
+                provider_mode = "llama_cpp"
+            else:
+                provider_mode = "custom"
+            self.settings["ai_provider_mode"] = provider_mode
+            prefix = f"ai_{provider_mode}_"
+            self.settings[prefix + "base_url"] = self.settings.get("ai_base_url", "")
+            self.settings[prefix + "model"] = self.settings.get("ai_model", "")
+            self.settings[prefix + "reasoning_effort"] = self.settings.get(
+                "ai_reasoning_effort", "low")
+            changed = True
+        prefix = f"ai_{provider_mode}_"
+        profile_defaults = {
+            prefix + "base_url": self.settings.get("ai_base_url", ""),
+            prefix + "model": self.settings.get("ai_model", ""),
+            prefix + "reasoning_effort": self.settings.get("ai_reasoning_effort", "low"),
+        }
+        for key, value in profile_defaults.items():
+            if key not in self.settings:
+                self.settings[key] = value
+                changed = True
         if self.settings.get("question_asr_mode") not in ("auto", "stepaudio", "sensevoice"):
             self.settings["question_asr_mode"] = "auto"
+            changed = True
+        if self.settings.get("interview_answer_mode") not in (
+                "local_fast", "hybrid", "cloud_quality"):
+            self.settings["interview_answer_mode"] = "hybrid"
             changed = True
         if self.settings.get("ui_font_size") not in ("紧凑", "标准", "较大"):
             self.settings["ui_font_size"] = "标准"
@@ -146,8 +198,8 @@ class NoteStore:
                 reminder["source_type"] = "independent"
                 reminder["source_id"] = ""
                 changed = True
-        if self.settings.get("schema_version", 1) < 5:
-            self.settings["schema_version"] = 5
+        if self.settings.get("schema_version", 1) < 7:
+            self.settings["schema_version"] = 7
             changed = True
         return changed
 
@@ -179,6 +231,93 @@ class NoteStore:
         self.data["reminders"] = [r for r in self.reminders if r.get("source_id") != note_id]
         self.data["quick_slots"] = [q for q in self.quick_slots if q.get("source_id") != note_id]
         self.save()
+
+    def archive_completed_task(self, kind: str, source_id: str, source_title: str,
+                               content: str) -> Dict:
+        """保存已完成任务快照，不依赖原便签是否继续存在。"""
+        record = {
+            "id": self._id(),
+            "kind": kind if kind in ("sticky", "journal") else "sticky",
+            "source_id": source_id,
+            "source_title": source_title.strip() or "无标题",
+            "content": content.strip(),
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.completed_tasks.insert(0, record)
+        self.save()
+        return record
+
+    def recover_legacy_completed_tasks(self) -> Dict[str, int]:
+        """将旧版误移出的任务安全回填到原便签，来源冲突记录留待人工确认。"""
+        if self.settings.get("completed_task_recovery_v2"):
+            return {"restored": 0, "pending_review": 0}
+        grouped = {}
+        for record in self.completed_tasks:
+            key = (record.get("source_id", ""), record.get("content", "").strip())
+            grouped.setdefault(key, record)
+        content_sources = {}
+        for (source_id, content), record in grouped.items():
+            normalized = content[2:] if content.startswith(("☐ ", "☑ ")) else content
+            content_sources.setdefault(normalized, set()).add(source_id)
+        pending, restored = [], 0
+        for (source_id, content), record in grouped.items():
+            normalized = content[2:] if content.startswith(("☐ ", "☑ ")) else content
+            if len(content_sources.get(normalized, set())) > 1:
+                record["recovery_status"] = "pending_review"
+                pending.append(record)
+                continue
+            note = next((item for item in self.notes if item.get("id") == source_id), None)
+            if not note:
+                record["recovery_status"] = "pending_review"
+                pending.append(record)
+                continue
+            pending_variant = "☐ " + normalized
+            completed_variant = "☑ " + normalized
+            if completed_variant in note.get("content", ""):
+                restored += 1
+                continue
+            if pending_variant in note.get("content", ""):
+                note["content"] = note["content"].replace(pending_variant, completed_variant, 1)
+            else:
+                separator = "\n\n" if note.get("content", "").strip() else ""
+                note["content"] = note.get("content", "").rstrip() + separator + completed_variant
+            note["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            restored += 1
+        self.data["completed_tasks"] = pending
+        self.settings["completed_task_recovery_v2"] = True
+        self.save()
+        return {"restored": restored, "pending_review": len(pending)}
+
+    def recover_mini_hermes_content(self) -> Dict[str, int]:
+        """根据用户确认的截图内容，定向恢复被旧任务归档逻辑移走的 mini hermes 条目。"""
+        if self.settings.get("mini_hermes_recovery_v3"):
+            return {"restored": 0}
+        note = next((item for item in self.notes if item.get("title") == "mini hermes"), None)
+        if not note:
+            return {"restored": 0}
+        blocks = [
+            "☐ min问答：\ncd D:/pythonProject1/mini-hermes\npython hermes_cli/main.py",
+            "☐ 正则清洗（快）：\ncd D:/pythonProject1/mini-hermes\npython scripts/rag_ocr_demo.py\n\"D:\\QingjianData\\health\\testOCR\\20250806游离甲功组合.png\"",
+            "☐ LLM 清洗（精准，需要网络）：\ncd D:/pythonProject1/mini-hermes\npython scripts/rag_ocr_demo.py\n\"D:\\QingjianData\\health\\testOCR\\20250813游离甲功组合.png\" --llm",
+        ]
+        existing = note.get("content", "")
+        restored = 0
+        for block in blocks:
+            marker = block.split("\n", 1)[0][2:]
+            if marker not in existing:
+                existing = existing.rstrip() + ("\n\n" if existing.strip() else "") + block
+                restored += 1
+        note["content"] = existing
+        if restored:
+            note["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        # “min问答”被错误同时标到两个标题；已按用户确认放回 mini hermes，移除旧冲突记录。
+        self.data["completed_tasks"] = [
+            record for record in self.completed_tasks
+            if not (record.get("content", "").lstrip().startswith("☑ min问答："))
+        ]
+        self.settings["mini_hermes_recovery_v3"] = True
+        self.save()
+        return {"restored": restored}
 
     def add_quick_slot(self, source_type: str, source_id: str, label: str) -> None:
         if not any(q.get("source_type") == source_type and q.get("source_id") == source_id

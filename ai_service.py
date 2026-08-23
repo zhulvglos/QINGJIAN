@@ -1,7 +1,9 @@
 import json
 import re
+import time
 from typing import Callable, Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -31,10 +33,23 @@ REASONING_EFFORTS = {
 }
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_LLAMA_CPP_PORT = 8080
+
+
 def ai_provider(base_url: str) -> str:
     normalized = str(base_url or "").strip().lower().rstrip("/")
     if normalized.startswith("https://api.stepfun.com/step_plan"):
         return "step_plan"
+    try:
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError:
+        return "custom"
+    if (parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS and
+            port == _LLAMA_CPP_PORT and
+            parsed.path in ("/v1", "/v1/chat/completions")):
+        return "llama_cpp"
     return "custom"
 
 
@@ -124,10 +139,13 @@ def chunk_interview_text(text: str, max_chars: int = 12000) -> List[str]:
 
 def parse_sse_lines(lines: Iterable[bytes], cancelled=None,
                     on_delta: Optional[Callable[[str], None]] = None,
-                    metadata: Optional[Dict] = None) -> str:
+                    metadata: Optional[Dict] = None,
+                    deadline: Optional[float] = None) -> str:
     parts = []
     emitted_length = 0
     for raw in lines:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AIServiceError("AI请求超过整体时限")
         if cancelled and cancelled.is_set():
             raise AIServiceError("已取消生成")
         line = raw.decode("utf-8", errors="replace").strip()
@@ -164,9 +182,14 @@ def parse_sse_lines(lines: Iterable[bytes], cancelled=None,
 def stream_chat_completion(config: Dict, messages: List[Dict], cancelled=None,
                            max_tokens: Optional[int] = 4096,
                            on_delta: Optional[Callable[[str], None]] = None,
-                           retry_empty: bool = False) -> str:
+                           retry_empty: bool = False,
+                           response_format: Optional[Dict] = None,
+                           temperature: float = 0.6,
+                           disable_thinking: bool = False,
+                           total_timeout: Optional[int] = None) -> str:
     token = str(config.get("api_key") or "").strip()
     model = str(config.get("model") or "").strip()
+    provider = ai_provider(str(config.get("base_url") or ""))
     if not token:
         raise AIServiceError("请先在设置中保存API Key")
     if not model:
@@ -175,17 +198,25 @@ def stream_chat_completion(config: Dict, messages: List[Dict], cancelled=None,
         "model": model,
         "messages": messages,
         "stream": True,
-        "temperature": 0.6,
+        "temperature": float(temperature),
         "top_p": 0.95,
     }
+    if response_format:
+        payload["response_format"] = response_format
     if max_tokens is not None:
         payload["max_tokens"] = int(max_tokens)
     reasoning_effort = str(config.get("reasoning_effort") or "").strip().lower()
-    if reasoning_effort in {"low", "medium", "high"}:
+    if provider == "llama_cpp" and disable_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif provider != "llama_cpp" and reasoning_effort in {"low", "medium", "high"}:
         payload["reasoning_effort"] = reasoning_effort
     last_metadata = {}
     attempts = 2 if retry_empty else 1
+    deadline = (time.monotonic() + max(1, int(total_timeout))
+                if total_timeout is not None else None)
     for attempt in range(attempts):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AIServiceError("AI请求超过整体时限")
         request_payload = dict(payload)
         if attempt:
             request_payload["messages"] = list(messages) + [{
@@ -199,9 +230,13 @@ def stream_chat_completion(config: Dict, messages: List[Dict], cancelled=None,
                      "Content-Type": "application/json", "Accept": "text/event-stream"},
         )
         try:
-            with urlopen(request, timeout=int(config.get("timeout", 180))) as response:
+            socket_timeout = int(config.get("timeout", 180))
+            if deadline is not None:
+                socket_timeout = min(socket_timeout, max(1, int(deadline - time.monotonic())))
+            with urlopen(request, timeout=socket_timeout) as response:
                 last_metadata = {}
-                result = parse_sse_lines(response, cancelled, on_delta, last_metadata)
+                result = parse_sse_lines(
+                    response, cancelled, on_delta, last_metadata, deadline=deadline)
         except HTTPError as exc:
             detail = ""
             try:
@@ -219,7 +254,7 @@ def stream_chat_completion(config: Dict, messages: List[Dict], cancelled=None,
     finish = last_metadata.get("finish_reason") or "未知"
     reasoning = last_metadata.get("reasoning_chars", 0)
     raise AIServiceError(
-        f"Step未返回最终答案（结束原因：{finish}，推理字符：{reasoning}），已自动重试一次")
+        f"AI服务未返回最终答案（结束原因：{finish}，推理字符：{reasoning}），已自动重试一次")
 
 
 def analyze_interview(task: str, text: str, config: Dict,
@@ -321,7 +356,9 @@ def answer_interview_question(question: str, context: str, knowledge: str,
         "优先使用面试知识库资料。涉及候选人个人经历、项目、职责、数据或成果时，只能使用知识库"
         "中明确存在的事实，不得虚构；知识库没有相关内容时，应给出不虚构具体经历和数字的自然"
         "回答框架。一般知识和技术问题（包括历史常识）在知识库没有答案时，可以使用可靠的"
-        "通用知识直接回答。\n\n"
+        "通用知识直接回答。遇到英文缩写、协议名、框架名或产品名时，必须先依据知识库中的"
+        "直接定义；知识库没有直接依据且不能可靠确认时，应明确说明术语需要确认，绝不能猜测"
+        "缩写全称、用途或虚构定义。\n\n"
         f"识别到的问题：{question}\n\n最近对话上下文：\n{context or '无'}\n\n"
         f"命中的知识库来源：{source_text}\n\n"
         f"面试知识库相关片段：\n{knowledge or '未检索到直接相关资料，请按通用知识或回答框架处理。'}"
@@ -330,4 +367,23 @@ def answer_interview_question(question: str, context: str, knowledge: str,
         {"role": "system", "content": (
             "你是中文面试即时回答助手。只输出可直接口述的答案正文，不使用任何模板或格式标题。")},
         {"role": "user", "content": prompt},
-    ], cancelled, max_tokens=None, on_delta=on_delta, retry_empty=True)
+    ], cancelled, max_tokens=None, on_delta=on_delta, retry_empty=True,
+        disable_thinking=True)
+
+
+def choose_interview_answer_provider(mode: str, terminology_risk: Dict,
+                                     knowledge_sources: List[str]):
+    """为实时面试回答选择本地或云端模型，并返回可展示的原因。"""
+    if mode == "cloud_quality":
+        return "step_plan", "已选择高质量云端模式"
+    if mode == "local_fast":
+        return "llama_cpp", "已选择极速本地模式"
+    risk = dict(terminology_risk or {})
+    if risk.get("correction_applied"):
+        return "step_plan", "语音中存在专业术语纠正"
+    unknown = list(risk.get("unknown_acronyms") or [])
+    if unknown:
+        return "step_plan", "存在未确认缩写：" + "、".join(unknown[:3])
+    if not knowledge_sources:
+        return "step_plan", "知识库没有直接命中"
+    return "llama_cpp", "知识库有依据，使用本地模型快速回答"

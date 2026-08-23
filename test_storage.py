@@ -25,6 +25,45 @@ class NoteStoreTests(unittest.TestCase):
             loaded.delete(note["id"])
             self.assertEqual(NoteStore(path).notes, [])
 
+    def test_completed_task_archive_is_persistent_and_keeps_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            store = NoteStore(path)
+            record = store.archive_completed_task(
+                "sticky", "note-1", "项目计划", "☑ 完成需求评审\n会议纪要已同步")
+            loaded = NoteStore(path)
+            self.assertEqual(loaded.completed_tasks[0]["id"], record["id"])
+            self.assertEqual(loaded.completed_tasks[0]["source_title"], "项目计划")
+            self.assertEqual(loaded.completed_tasks[0]["content"], "☑ 完成需求评审\n会议纪要已同步")
+
+    def test_legacy_completed_tasks_restore_without_duplicate_or_guessing_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            store = NoteStore(path)
+            first = store.new_note("第一条", "☐ 整理纪要")
+            second = store.new_note("第二条", "")
+            second["id"] = "second-note"
+            store.archive_completed_task("sticky", first["id"], first["title"], "☑ 整理纪要")
+            store.archive_completed_task("sticky", first["id"], first["title"], "☑ 整理纪要")
+            store.archive_completed_task("sticky", second["id"], second["title"], "☑ 整理纪要")
+            result = store.recover_legacy_completed_tasks()
+            self.assertEqual(result, {"restored": 0, "pending_review": 2})
+            self.assertIn("☐ 整理纪要", first["content"])
+            self.assertEqual(len(store.completed_tasks), 2)
+
+    def test_mini_hermes_recovery_restores_confirmed_blocks_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            store = NoteStore(path)
+            note = store.new_note("mini hermes", "☐ ocr图片：\n命令", kind="sticky")
+            store.archive_completed_task("sticky", note["id"], note["title"], "☑ min问答：\n命令")
+            self.assertEqual(store.recover_mini_hermes_content(), {"restored": 3})
+            self.assertIn("☐ min问答：", note["content"])
+            self.assertIn("☐ 正则清洗（快）：", note["content"])
+            self.assertIn("☐ LLM 清洗（精准，需要网络）：", note["content"])
+            self.assertEqual(store.completed_tasks, [])
+            self.assertEqual(store.recover_mini_hermes_content(), {"restored": 0})
+
     def test_existing_notes_migrate_to_sticky_and_unified_reminder(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data.json"
@@ -47,6 +86,34 @@ class NoteStoreTests(unittest.TestCase):
             self.assertEqual(store.settings["ai_base_url"], STEP_PLAN_BASE_URL)
             self.assertEqual(store.settings["ai_model"], STEP_PLAN_MODEL)
             self.assertEqual(store.settings["ai_reasoning_effort"], "low")
+
+    def test_existing_local_ai_config_migrates_to_separate_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            path.write_text(json.dumps({"settings": {
+                "schema_version": 5,
+                "ai_base_url": "http://127.0.0.1:8080/v1",
+                "ai_model": "qwen3-8b-local",
+                "ai_reasoning_effort": "high",
+            }}), encoding="utf-8")
+            store = NoteStore(path)
+            self.assertEqual(store.settings["ai_provider_mode"], "llama_cpp")
+            self.assertEqual(
+                store.settings["ai_llama_cpp_base_url"],
+                "http://127.0.0.1:8080/v1")
+            self.assertEqual(store.settings["ai_llama_cpp_model"], "qwen3-8b-local")
+            self.assertEqual(store.settings["ai_llama_cpp_reasoning_effort"], "high")
+            self.assertEqual(store.settings["ai_step_plan_base_url"], STEP_PLAN_BASE_URL)
+            self.assertEqual(store.settings["schema_version"], 7)
+            self.assertEqual(store.settings["interview_answer_mode"], "hybrid")
+
+    def test_invalid_interview_answer_mode_resets_to_hybrid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            path.write_text(json.dumps({"settings": {
+                "interview_answer_mode": "invalid",
+            }}), encoding="utf-8")
+            self.assertEqual(NoteStore(path).settings["interview_answer_mode"], "hybrid")
 
     def test_source_reminder_due_snooze_and_recurring_completion(self):
         with tempfile.TemporaryDirectory() as directory:

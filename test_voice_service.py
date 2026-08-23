@@ -30,6 +30,35 @@ class VoiceServiceTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertGreaterEqual(len(completed[0]), 16000 * 2 * 15)
 
+    def test_meeting_vad_marks_forced_and_natural_endings(self):
+        segmenter = MeetingUtteranceSegmenter(
+            16000, 1, silence_seconds=0.8, max_seconds=2.0,
+            overlap_seconds=0.3)
+        speech = b"\xe8\x03" * int(16000 * 2.1)
+        forced = segmenter.feed_events(speech)
+        self.assertEqual(forced[0].reason, "max_duration")
+        self.assertFalse(forced[0].is_final)
+        trailing = b"\x00\x00" * int(16000 * 0.8)
+        natural = segmenter.feed_events(trailing)
+        self.assertEqual(natural[-1].reason, "silence")
+        self.assertTrue(natural[-1].is_final)
+
+    def test_interview_window_keeps_question_across_normal_two_second_pause(self):
+        segmenter = MeetingUtteranceSegmenter(
+            16000, 1, silence_seconds=3.5, max_seconds=15.0,
+            overlap_seconds=1.0)
+        speech = b"\xe8\x03" * int(16000 * 1.0)
+        normal_pause = b"\x00\x00" * int(16000 * 2.0)
+        self.assertEqual(segmenter.feed_events(speech + normal_pause), [])
+
+        resumed_speech = b"\xe8\x03" * int(16000 * 1.0)
+        ending_pause = b"\x00\x00" * int(16000 * 3.5)
+        completed = segmenter.feed_events(resumed_speech + ending_pause)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].reason, "silence")
+        self.assertTrue(completed[0].is_final)
+        self.assertGreater(len(completed[0].audio), len(speech + resumed_speech))
+
     def test_transcript_is_normalized_to_simplified_chinese(self):
         self.assertEqual(
             to_simplified_chinese("會議聲音與數據轉寫"),
@@ -98,6 +127,22 @@ class VoiceServiceTests(unittest.TestCase):
             snapshot = recorder.snapshot_meeting_chunk(0, min_seconds=0.05)
             self.assertIsNotNone(snapshot)
             with wave.open(str(snapshot[0]), "rb") as audio:
+                self.assertGreater(audio.getnframes(), 0)
+
+    def test_live_meeting_chunk_is_normalized_for_asr(self):
+        import wave
+        from voice_service import DualTrackRecorder
+
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = DualTrackRecorder(Path(folder))
+            recorder.system_path = Path(folder) / "meeting.wav"
+            recorder.system_rate = 48000
+            recorder.system_channels = 2
+            stereo = b"\xe8\x03\xe8\x03" * 4800
+            chunk = recorder.write_live_meeting_chunk(stereo, 1)
+            with wave.open(str(chunk), "rb") as audio:
+                self.assertEqual(audio.getframerate(), 16000)
+                self.assertEqual(audio.getnchannels(), 1)
                 self.assertGreater(audio.getnframes(), 0)
 
     def test_format_transcript_with_speaker_and_timestamp(self):

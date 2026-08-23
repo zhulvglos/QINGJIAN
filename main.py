@@ -1,6 +1,9 @@
 import ctypes
+import json
 from pathlib import Path
 import queue
+import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -11,6 +14,7 @@ import webbrowser
 from datetime import date, datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, Optional
+from PIL import Image
 
 from calendar_picker import CalendarPicker
 from dpi_scaler import WindowDpiScaler
@@ -19,9 +23,9 @@ from display_manager import (DisplayArea, EdgeHideController, detect_docked_edge
                              ensure_visible_position, enumerate_displays,
                              set_window_position, window_bounds)
 from ai_service import (AIServiceError, INTERVIEW_TASKS, MEETING_TASKS,
-                        REASONING_EFFORTS, STEP_PLAN_MODELS, ai_provider,
+                        REASONING_EFFORTS, STEP_PLAN_MODELS,
                         analyze_interview, analyze_meeting, answer_interview_question,
-                        stream_chat_completion)
+                        choose_interview_answer_provider, stream_chat_completion)
 from storage import NoteStore
 from sensevoice_service import SenseVoiceLiveSession, SenseVoiceTranscriber
 from stepaudio_service import StepAudioASR
@@ -37,14 +41,31 @@ from news_service import (NewsServiceError, effective_daily_date, fetch_daily,
                           load_daily_cache, save_daily_cache)
 from free_model_service import (effective_flash_date, fetch_free_model_digest)
 from interview_knowledge_base import InterviewKnowledgeBase
+from interview_terminology import InterviewTerminology
+from llama_runtime import (LlamaRuntimeError, LlamaRuntimeManager,
+                           discover_managed_runtime)
 
 
 QUESTION_ASR_OPTIONS = {
-    "自动（StepAudio优先）": "auto",
-    "仅StepAudio在线": "stepaudio",
+    "自动（SenseVoice优先）": "auto",
     "仅SenseVoice本地": "sensevoice",
+    "仅StepAudio在线": "stepaudio",
 }
+
+AI_PROVIDER_OPTIONS = {
+    "Step Plan云端": "step_plan",
+    "本地 llama.cpp": "llama_cpp",
+    "其他OpenAI兼容接口": "custom",
+}
+AI_PROVIDER_LABELS = {value: label for label, value in AI_PROVIDER_OPTIONS.items()}
 QUESTION_ASR_LABELS = {value: label for label, value in QUESTION_ASR_OPTIONS.items()}
+INTERVIEW_ANSWER_OPTIONS = {
+    "智能混合": "hybrid",
+    "极速本地": "local_fast",
+    "高质量云端": "cloud_quality",
+}
+INTERVIEW_ANSWER_LABELS = {
+    value: label for label, value in INTERVIEW_ANSWER_OPTIONS.items()}
 UI_FONT_SCALINGS = {"紧凑": 0.88, "标准": 1.0, "较大": 1.14}
 
 
@@ -72,7 +93,7 @@ def cyclic_index(length, current_index, step):
 class SegmentedNav(tk.Canvas):
     """适合窄窗口的分段导航，使用轻量滑动高亮。"""
     SECTIONS = (("reminder", "提醒"), ("sticky", "便签"),
-                ("journal", "笔记"), ("news", "新闻"))
+                ("journal", "笔记"), ("news", "新闻"), ("settings", "设置"))
 
     def __init__(self, parent, command):
         super().__init__(parent, height=42, highlightthickness=0, bd=0,
@@ -194,6 +215,16 @@ class StickyNotesApp:
         self.root = root
         self.instance_guard = instance_guard
         self.store = NoteStore()
+        self.completed_task_recovery = self.store.recover_legacy_completed_tasks()
+        self.mini_hermes_recovery = self.store.recover_mini_hermes_content()
+        if (not self.store.settings.get("llama_cpp_executable") or
+                not self.store.settings.get("llama_cpp_model_path")):
+            discovered_runtime = discover_managed_runtime(Path(__file__).resolve().parent)
+            if discovered_runtime:
+                self.store.settings["llama_cpp_executable"] = discovered_runtime["executable"]
+                self.store.settings["llama_cpp_model_path"] = discovered_runtime["model_path"]
+                self.store.settings["llama_cpp_autostart"] = True
+                self.store.save()
         self.current: Optional[Dict] = None
         self.current_reminder: Optional[Dict] = None
         self.current_news: Optional[Dict] = None
@@ -205,6 +236,10 @@ class StickyNotesApp:
         self.interview_knowledge_base = InterviewKnowledgeBase(
             Path(__file__).resolve().parent / "面试知识库",
             self.store.path.parent / "interview_kb_index.json")
+        self.interview_terminology = InterviewTerminology(
+            Path(__file__).resolve().parent / "面试知识库" / "AI技术术语词典.md")
+        self.llama_runtime = LlamaRuntimeManager(
+            Path(__file__).resolve().parent / "logs")
         self.news_items = []
         self.news_loading = False
         self.news_loading_modes = set()
@@ -217,6 +252,7 @@ class StickyNotesApp:
         self.main_dpi_scaler = None
         self.voice_dpi_scaler = None
         self.current_section = "sticky"
+        self.task_view = "pending"
         self.section_selection_ids = {}
         self.save_job = None
         self.layout_job = None
@@ -224,6 +260,7 @@ class StickyNotesApp:
         self.dragging = False
         self.resizing = False
         self.compact_mode = False
+        self.compact_sash_user_resized = False
         self.drag_candidate = None
         self.drag_source = None
         self.resize_origin = None
@@ -233,9 +270,10 @@ class StickyNotesApp:
         self.drag_offset = (0, 0)
         self.hovered = False
         self.theme_name = self.store.settings.get("theme", "黄色")
-        if self.theme_name not in THEMES:
+        if self.theme_name not in THEMES and self.theme_name != "图片皮肤":
             self.theme_name = "黄色"
-        self.colors = THEMES[self.theme_name]
+        self.colors = (self.store.settings.get("image_palette") if self.theme_name == "图片皮肤"
+                       else THEMES[self.theme_name]) or THEMES["黄色"]
         self.bg_widgets = []
         self.panel_widgets = []
         self.nav_widgets = []
@@ -277,6 +315,8 @@ class StickyNotesApp:
         else:
             self.clear_editor()
         self.root.after(500, self.check_reminders)
+        if self.store.settings.get("llama_cpp_autostart"):
+            self.root.after(800, self.autostart_local_llama)
         self.tray = TrayManager()
         self.tray.start()
         self.root.after(250, self.poll_tray_events)
@@ -393,10 +433,13 @@ class StickyNotesApp:
         self.new_button.pack(side="left")
         self.delete_button = ttk.Button(toolbar, text="删除", command=self.delete_note)
         self.delete_button.pack(side="left", padx=5)
+        self.pending_button = ttk.Button(toolbar, text="待办", command=lambda: self.set_task_view("pending"))
+        self.pending_button.pack(side="left", padx=5)
+        self.task_button = ttk.Button(toolbar, text="已完成", command=lambda: self.set_task_view("completed"))
+        self.task_button.pack(side="left", padx=5)
         self.settings_button_text = tk.StringVar(value="⚙ 设置")
         self.settings_button = ttk.Button(toolbar, textvariable=self.settings_button_text,
                                           command=self.toggle_settings)
-        self.settings_button.pack(side="right")
         self.calendar_button = ttk.Button(toolbar, text="📅 日历视图", command=self.open_calendar_view)
         self.news_refresh_button = ttk.Button(toolbar, text="刷新", command=lambda: self.load_news(True))
         self.news_home_button = ttk.Button(toolbar, text="打开 AI HOT", command=self.open_news_home)
@@ -429,10 +472,8 @@ class StickyNotesApp:
         self.top_label_var = tk.StringVar()
         self.settings_frame = tk.Frame(self.root, padx=10, pady=7)
         self.bg_widgets.append(self.settings_frame)
-        settings_title = tk.Label(self.settings_frame, text="设置",
-                                  font=("Microsoft YaHei UI", 15, "bold"), anchor="w")
-        settings_title.pack(fill="x", pady=(4, 16))
-        self.settings_contrast_labels = [settings_title]
+        # 设置板块直接从顶部导航下方开始，不再重复显示“设置”标题。
+        self.settings_contrast_labels = []
         checks_row = tk.Frame(self.settings_frame)
         checks_row.pack(fill="x", pady=(0, 5))
         self.bg_widgets.append(checks_row)
@@ -467,13 +508,15 @@ class StickyNotesApp:
         ttk.Scale(alpha_row, from_=0.45, to=1.0, variable=self.alpha_var,
                   command=self.change_alpha).pack(side="left", fill="x", expand=True, padx=8)
 
-        color_label = tk.Label(alpha_row, text="色彩")
+        color_label = tk.Label(alpha_row, text="皮肤更换")
         color_label.pack(side="left", padx=(4, 3))
         self.settings_contrast_labels.append(color_label)
         self.theme_var = tk.StringVar(value=self.theme_name)
         self.theme_box = ttk.Combobox(alpha_row, textvariable=self.theme_var,
-                                      values=list(THEMES), state="readonly", width=5)
+                                      values=list(THEMES) + ["图片皮肤"], state="readonly", width=8)
         self.theme_box.pack(side="left")
+        ttk.Button(alpha_row, text="本地图片", command=self.choose_background_image).pack(side="left", padx=(6, 0))
+        ttk.Button(alpha_row, text="恢复纯色", command=self.clear_background_image).pack(side="left", padx=(4, 0))
 
         font_row = tk.Frame(self.settings_frame)
         font_row.pack(fill="x", pady=(6, 0))
@@ -497,15 +540,20 @@ class StickyNotesApp:
                             font=("Microsoft YaHei UI", 11, "bold"), anchor="w")
         ai_title.pack(fill="x", pady=(3, 6))
         self.settings_contrast_labels.append(ai_title)
+        provider_mode = self.store.settings.get("ai_provider_mode", "step_plan")
+        if provider_mode not in AI_PROVIDER_LABELS:
+            provider_mode = "step_plan"
+        self._active_ai_provider_mode = provider_mode
+        self.ai_provider_var = tk.StringVar(value=AI_PROVIDER_LABELS[provider_mode])
         self.ai_base_url_var = tk.StringVar(value=self.store.settings.get("ai_base_url", ""))
         self.ai_model_var = tk.StringVar(value=self.store.settings.get("ai_model", ""))
         self.ai_reasoning_var = tk.StringVar(
             value=self.store.settings.get("ai_reasoning_effort", "low"))
         question_asr_mode = self.store.settings.get("question_asr_mode", "auto")
         self.question_asr_var = tk.StringVar(
-            value=QUESTION_ASR_LABELS.get(question_asr_mode, "自动（StepAudio优先）"))
+            value=QUESTION_ASR_LABELS.get(question_asr_mode, "自动（SenseVoice优先）"))
         self.ai_token_var = tk.StringVar(
-            value=self.TOKEN_MASK if load_ai_token() else "")
+            value=self.TOKEN_MASK if load_ai_token(provider_mode) else "")
         self.ai_setting_entries = []
 
         def setting_entry(label_text, variable, secret=False):
@@ -520,6 +568,18 @@ class StickyNotesApp:
             entry.pack(side="left", fill="x", expand=True, ipady=3)
             self.ai_setting_entries.append(entry)
             return entry
+
+        provider_row = tk.Frame(ai_settings)
+        provider_row.pack(fill="x", pady=2)
+        self.bg_widgets.append(provider_row)
+        provider_label = tk.Label(provider_row, text="文本大模型", width=9, anchor="w")
+        provider_label.pack(side="left")
+        self.settings_contrast_labels.append(provider_label)
+        self.ai_provider_box = ttk.Combobox(
+            provider_row, textvariable=self.ai_provider_var,
+            values=list(AI_PROVIDER_OPTIONS), state="readonly")
+        self.ai_provider_box.pack(side="left", fill="x", expand=True)
+        self.ai_provider_box.bind("<<ComboboxSelected>>", self.change_ai_provider)
 
         self.ai_base_url_entry = setting_entry("接口地址", self.ai_base_url_var)
         self.ai_base_url_entry.bind("<FocusOut>", self.refresh_ai_provider, add="+")
@@ -587,6 +647,49 @@ class StickyNotesApp:
         self.ai_token_entry = setting_entry("API Key", self.ai_token_var, True)
         self.ai_token_entry.bind("<FocusIn>", self.clear_ai_token_mask)
         self.ai_token_entry.bind("<FocusOut>", self.restore_ai_token_mask)
+
+        self.llama_runtime_frame = tk.Frame(ai_settings)
+        self.llama_runtime_frame.pack(fill="x", pady=(3, 1))
+        self.bg_widgets.append(self.llama_runtime_frame)
+        self.llama_executable_var = tk.StringVar(
+            value=self.store.settings.get("llama_cpp_executable", ""))
+        self.llama_model_path_var = tk.StringVar(
+            value=self.store.settings.get("llama_cpp_model_path", ""))
+        self.llama_autostart_var = tk.BooleanVar(
+            value=bool(self.store.settings.get("llama_cpp_autostart", False)))
+
+        def runtime_path_row(label_text, variable, command):
+            row = tk.Frame(self.llama_runtime_frame)
+            row.pack(fill="x", pady=2)
+            self.bg_widgets.append(row)
+            label = tk.Label(row, text=label_text, width=9, anchor="w")
+            label.pack(side="left")
+            self.settings_contrast_labels.append(label)
+            entry = tk.Entry(row, textvariable=variable, relief="solid", bd=1)
+            entry.pack(side="left", fill="x", expand=True, ipady=3)
+            ttk.Button(row, text="选择", width=5, command=command).pack(side="left", padx=(4, 0))
+            return entry
+
+        self.llama_executable_entry = runtime_path_row(
+            "服务程序", self.llama_executable_var, self.choose_llama_executable)
+        self.llama_model_path_entry = runtime_path_row(
+            "GGUF模型", self.llama_model_path_var, self.choose_llama_model)
+        runtime_options = tk.Frame(self.llama_runtime_frame)
+        runtime_options.pack(fill="x", pady=2)
+        self.bg_widgets.append(runtime_options)
+        self.llama_autostart_check = tk.Checkbutton(
+            runtime_options, text="随轻笺自动启动本地大模型",
+            variable=self.llama_autostart_var, anchor="w")
+        self.llama_autostart_check.pack(side="left")
+        self.llama_start_button = ttk.Button(
+            runtime_options, text="启动/检查", command=self.start_local_llama_from_settings)
+        self.llama_start_button.pack(side="right")
+        self.llama_runtime_status_var = tk.StringVar(value="本地服务：尚未检查")
+        self.llama_runtime_status = tk.Label(
+            self.llama_runtime_frame, textvariable=self.llama_runtime_status_var,
+            anchor="w", justify="left", wraplength=220)
+        self.llama_runtime_status.pack(fill="x", padx=(72, 0), pady=(0, 2))
+        self.muted_labels.append(self.llama_runtime_status)
         self.ai_hint_window = None
         ai_settings.bind("<Configure>", self.update_ai_description_wrap, add="+")
         self.refresh_ai_provider()
@@ -604,7 +707,7 @@ class StickyNotesApp:
         self.settings_contrast_labels.append(asr_label)
         asr_help = tk.Label(
             ai_settings,
-            text="自动模式在会议方停顿约0.8秒后上传完整语句；单段最长15秒。失败时切换本地SenseVoice，完整录音不上传。",
+            text="自动模式优先使用本地SenseVoice；连续问题按15秒内部块识别并拼接，最长约75秒。仅本地失败时调用在线StepAudio。",
             anchor="w", justify="left", wraplength=220)
         asr_help.pack(fill="x", padx=(72, 0), pady=(0, 2))
         self.muted_labels.append(asr_help)
@@ -646,8 +749,9 @@ class StickyNotesApp:
         self.stepaudio_connection_testing = False
         self.settings_visible = False
 
-        body = tk.PanedWindow(self.root, orient="horizontal", sashwidth=1,
-                              bd=0, relief="flat")
+        # 窄窗口时这里的横向分隔条就是底部标题框的可拖动上边框。
+        body = tk.PanedWindow(self.root, orient="horizontal", sashwidth=6,
+                              sashrelief="raised", bd=0, relief="flat")
         body.pack(fill="both", expand=True, padx=8, pady=8)
         left = tk.Frame(body, width=145)
         right = tk.Frame(body)
@@ -673,6 +777,7 @@ class StickyNotesApp:
         self.search_entry = tk.Entry(self.note_filter_frame, textvariable=self.search_var,
                                      relief="flat")
         self.search_entry.pack(fill="x", pady=(4, 0))
+        # 在窄窗口中，列表填满底部面板，使其底边始终贴合轻笺窗口底边。
         self.listbox.pack(fill="both", expand=True, padx=4, pady=4)
 
         self.title_var = tk.StringVar()
@@ -691,16 +796,10 @@ class StickyNotesApp:
                               padx=10, pady=8)
         self.editor.pack(fill="both", expand=True)
         self.editor.tag_configure("bold", font=("Microsoft YaHei UI", 11, "bold"))
+        self.configure_task_checklist(self.editor)
 
-        self.learning_actions = tk.Frame(right, padx=10, pady=5)
-        self.bg_widgets.append(self.learning_actions)
-        ttk.Button(self.learning_actions, text="✓ 今日已积累", command=self.mark_learning).pack(side="left")
-        ttk.Button(self.learning_actions, text="撤销今日", command=self.unmark_learning).pack(side="left", padx=5)
-        ttk.Button(self.learning_actions, text="积累日历", command=self.open_learning_calendar).pack(side="left")
+        # 保留统计变量以兼容已有学习记录；不再显示学习积累按钮区域。
         self.learning_stats_var = tk.StringVar()
-        self.learning_stats_label = tk.Label(self.learning_actions, textvariable=self.learning_stats_var)
-        self.learning_stats_label.pack(side="right")
-        self.muted_labels.append(self.learning_stats_label)
 
         reminder_actions = tk.Frame(right, padx=10, pady=5)
         self.reminder_actions = reminder_actions
@@ -712,30 +811,24 @@ class StickyNotesApp:
         ttk.Button(reminder_actions, text="跳过", command=self.skip_current_reminder).pack(side="left", padx=3)
         ttk.Button(reminder_actions, text="暂停", command=self.pause_current_reminder).pack(side="left")
 
-        reminder = tk.Frame(right, padx=10, pady=8)
-        self.reminder_frame = reminder
-        reminder.pack(fill="x")
-        self.bg_widgets.append(reminder)
-        reminder_label = tk.Label(reminder, text="提醒")
-        reminder_label.pack(side="left")
-        self.muted_labels.append(reminder_label)
+        # 保留提醒数据变量，兼容已有提醒数据；不再在便签编辑区显示提醒控件。
         self.reminder_var = tk.StringVar()
-        self.reminder_entry = tk.Entry(reminder, textvariable=self.reminder_var,
-                                       relief="solid", bd=1)
-        self.reminder_entry.pack(side="left", fill="x", expand=True, padx=7)
-        ttk.Button(reminder, text="选择", command=lambda: self._set_picked_time(self.reminder_var)).pack(side="left")
-        ttk.Button(reminder, text="设置", command=self.set_reminder).pack(side="left")
-        hint = tk.Label(right, text="格式：2026-07-20 18:30；留空后点击“设置”可取消",
-                        anchor="w", font=("Microsoft YaHei UI", 8))
-        self.reminder_hint = hint
-        hint.pack(fill="x", padx=10, pady=(0, 8))
-        self.muted_labels.append(hint)
 
         self.status_var = tk.StringVar(value="本地保存")
         self.reminder_actions.pack_forget()
-        self.learning_actions.pack_forget()
         self._build_quick_rail()
         self._build_resize_handles()
+
+
+
+
+
+
+
+
+
+
+
 
     def _build_resize_handles(self):
         """为无系统边框窗口补充左、右、底边和两个底角缩放热区。"""
@@ -815,6 +908,7 @@ class StickyNotesApp:
             widget.bind("<B1-Motion>", self.drag_window)
         self.root.bind("<Configure>", self.on_configure)
         self.body.bind("<Configure>", self.schedule_responsive_layout)
+        self.body.bind("<ButtonRelease-1>", self.remember_compact_sash, add="+")
         self.root.bind("<Map>", self.on_window_map)
         self.root.bind("<Alt-Key-1>", lambda _e: self.switch_section("reminder"))
         self.root.bind("<Alt-Key-2>", lambda _e: self.switch_section("sticky"))
@@ -1258,6 +1352,7 @@ class StickyNotesApp:
         if compact == self.compact_mode:
             return
         self.compact_mode = compact
+        self.compact_sash_user_resized = False
         for pane in (self.left_panel, self.right_panel):
             if str(pane) in self.body.panes():
                 self.body.forget(pane)
@@ -1269,7 +1364,7 @@ class StickyNotesApp:
             self.search_entry.pack_forget()
             self.category_filter.pack(side="left", fill="x", expand=True)
             self.search_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
-            self.root.after_idle(self.position_compact_sash)
+            self.root.after_idle(lambda: self.position_compact_sash(force=True))
         else:
             self.body.configure(orient="horizontal")
             self.body.add(self.right_panel, minsize=220)
@@ -1280,16 +1375,30 @@ class StickyNotesApp:
             self.search_entry.pack(fill="x", pady=(4, 0))
             self.root.after_idle(self.position_wide_sash)
 
-    def position_compact_sash(self):
-        if not self.compact_mode or len(self.body.panes()) != 2 or not self.body.winfo_ismapped():
+    def remember_compact_sash(self, event):
+        """用户拖动窄窗口分隔条后，保留其手动设置的标题框高度。"""
+        if not self.compact_mode or len(self.body.panes()) != 2:
             return
-        row_height = tkfont.Font(font=self.listbox.cget("font")).metrics("linespace") + 4
-        visible_rows = min(5, max(1, self.listbox.size()))
-        filter_height = 36 if self.current_section == "journal" else 0
-        list_height = visible_rows * row_height + filter_height + 14
+        try:
+            sash_y = self.body.sash_coord(0)[1]
+        except tk.TclError:
+            return
+        if abs(event.y - sash_y) <= 12:
+            self.compact_sash_user_resized = True
+
+    def position_compact_sash(self, force=False):
+        if (not self.compact_mode or len(self.body.panes()) != 2 or
+                not self.body.winfo_ismapped() or
+                (self.compact_sash_user_resized and not force)):
+            return
         available = self.body.winfo_height()
-        list_height = min(max(70, list_height), max(85, available - 150))
-        self.body.sash_place(0, 0, max(150, available - list_height))
+        row_height = tkfont.Font(font=self.listbox.cget("font")).metrics("linespace") + 4
+        filter_height = 36 if self.current_section == "journal" else 0
+        # 默认高度严格按当前标题条数计算；标题框底部由下方面板自动贴住窗口底边。
+        list_height = max(1, self.listbox.size()) * row_height + filter_height + 12
+        list_height = min(list_height, max(row_height + filter_height + 12, available - 150))
+        sash_y = max(150, available - list_height)
+        self.body.sash_place(0, 0, sash_y)
 
     def position_wide_sash(self):
         if self.compact_mode or len(self.body.panes()) != 2 or not self.body.winfo_ismapped():
@@ -1304,9 +1413,7 @@ class StickyNotesApp:
         self.layout_job = None
         if self.settings_visible:
             return
-        if self.compact_mode:
-            self.position_compact_sash()
-        else:
+        if not self.compact_mode:
             self.position_wide_sash()
         self.enforce_news_clean_layout()
 
@@ -1341,14 +1448,14 @@ class StickyNotesApp:
         """新闻板块只保留新闻控件，防止异步或跨屏布局恢复旧编辑控件。"""
         if self.current_section != "news":
             return
-        for widget in (self.title_entry, self.reminder_frame, self.reminder_hint,
-                       self.reminder_actions, self.learning_actions,
+        for widget in (self.title_entry, self.reminder_actions,
                        self.note_filter_frame, self.ai_interview_frame):
             widget.pack_forget()
         self.show_news_title(True)
 
     def apply_theme(self, save=True):
-        self.colors = THEMES[self.theme_name]
+        palette = self.store.settings.get("image_palette") if self.theme_name == "图片皮肤" else None
+        self.colors = palette if isinstance(palette, dict) else THEMES.get(self.theme_name, THEMES["黄色"])
         c = self.colors
         self.root.configure(bg=c["bg"])
         for widget in self.bg_widgets:
@@ -1369,6 +1476,9 @@ class StickyNotesApp:
         self.section_nav.set_theme(c)
         self.section_nav.set_counts({"reminder": sum(
             1 for r in self.store.reminders if r.get("status") in ("pending", "notified"))})
+        # 未手动拖动过分隔条时，以当前标题条数设定默认高度。
+        if self.compact_mode and not self.compact_sash_user_resized:
+            self.root.after_idle(self.position_compact_sash)
         self.root.after_idle(self.adjust_responsive_sash)
         for handle in self.resize_handles:
             handle.configure(bg=c["bg"])
@@ -1384,9 +1494,9 @@ class StickyNotesApp:
                                selectbackground=c["accent"])
         for widget in (self.title_entry, self.editor):
             widget.configure(bg=c["bg"], fg=c["text"], insertbackground=c["text"])
+        self.editor.tag_configure("task_marker", foreground=c["accent"], underline=1)
+        self.editor.tag_configure("task_done", foreground=c["muted"], overstrike=1)
         self.news_title_label.configure(bg=c["bg"], fg=c["text"])
-        self.reminder_entry.configure(bg=c["input"], fg=c["text"],
-                                      insertbackground=c["text"])
         for entry in self.ai_setting_entries:
             entry.configure(bg=c["input"], fg=c["text"], insertbackground=c["text"])
         for button in (self.ai_model_button, self.ai_reasoning_button):
@@ -1396,8 +1506,8 @@ class StickyNotesApp:
             menu.configure(bg=c["panel"], fg=c["text"], activebackground=c["accent"],
                            activeforeground="white")
         self.style.configure("TButton", background=c["panel"], foreground=c["text"], padding=5)
-        self.style.map("TButton", background=[("active", c["accent"])],
-                       foreground=[("active", "white")])
+        self.style.map("TButton", background=[("selected", c["accent"]), ("active", c["accent"])],
+                       foreground=[("selected", "white"), ("active", "white")])
         self.style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
         self.style.configure("Horizontal.TScale", background=c["bg"])
         self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"])
@@ -1417,8 +1527,98 @@ class StickyNotesApp:
         self.theme_name = self.theme_var.get()
         self.apply_theme()
 
+    def choose_background_image(self):
+        source = filedialog.askopenfilename(
+            title="选择本地皮肤图片", filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.webp")])
+        if not source:
+            return
+        try:
+            image = Image.open(source).convert("RGB")
+            skin_dir = Path("D:/QingjianData/轻笺/skins")
+            skin_dir.mkdir(parents=True, exist_ok=True)
+            target = skin_dir / f"skin-{int(time.time())}{Path(source).suffix.lower()}"
+            shutil.copy2(source, target)
+            self.store.settings["background_image"] = str(target)
+            self.store.settings["image_palette"] = self.image_skin_palette(image)
+            self.theme_name = "图片皮肤"
+            self.theme_var.set(self.theme_name)
+            self.apply_theme()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("皮肤图片", f"无法使用该图片：{error}", parent=self.root)
+
+    def clear_background_image(self):
+        self.store.settings["background_image"] = ""
+        self.store.settings.pop("image_palette", None)
+        if self.theme_name == "图片皮肤":
+            self.theme_name = "黄色"
+            self.theme_var.set(self.theme_name)
+            self.apply_theme()
+            return
+        self.store.save()
+
+    @staticmethod
+    def image_skin_palette(image):
+        """从本地图片提取主色，并生成可读的完整 Tkinter 皮肤调色板。"""
+        sample = image.resize((80, 80)).quantize(colors=8).convert("RGB")
+        colors = sample.getcolors(sample.width * sample.height) or []
+        red, green, blue = max(colors, key=lambda item: item[0])[1]
+
+        def mix(color, target, ratio):
+            return tuple(round(value * (1 - ratio) + goal * ratio)
+                         for value, goal in zip(color, target))
+
+        def as_hex(color):
+            return "#{:02x}{:02x}{:02x}".format(*color)
+
+        luminance = (red * 299 + green * 587 + blue * 114) / 1000
+        dark_text = luminance > 145
+        base = (red, green, blue)
+        return {
+            "bg": as_hex(mix(base, (255, 255, 255) if dark_text else (0, 0, 0), 0.38)),
+            "panel": as_hex(mix(base, (255, 255, 255) if dark_text else (0, 0, 0), 0.55)),
+            "input": as_hex(mix(base, (255, 255, 255) if dark_text else (0, 0, 0), 0.25)),
+            "accent": as_hex(mix(base, (40, 160, 255) if dark_text else (110, 205, 255), 0.48)),
+            "text": "#1f2428" if dark_text else "#f7fbff",
+            "muted": "#53616d" if dark_text else "#c6d5e1",
+        }
+
+    @staticmethod
+    def ai_profile_key(provider, field):
+        return f"ai_{provider}_{field}"
+
+    def remember_ai_profile(self, provider=None):
+        provider = provider or self._active_ai_provider_mode
+        self.store.settings[self.ai_profile_key(provider, "base_url")] = (
+            self.ai_base_url_var.get().strip().rstrip("/"))
+        self.store.settings[self.ai_profile_key(provider, "model")] = (
+            self.ai_model_var.get().strip())
+        self.store.settings[self.ai_profile_key(provider, "reasoning_effort")] = (
+            self.ai_reasoning_var.get())
+
+    def load_ai_profile(self, provider):
+        self.ai_base_url_var.set(self.store.settings.get(
+            self.ai_profile_key(provider, "base_url"), ""))
+        self.ai_model_var.set(self.store.settings.get(
+            self.ai_profile_key(provider, "model"), ""))
+        self.ai_reasoning_var.set(self.store.settings.get(
+            self.ai_profile_key(provider, "reasoning_effort"), "low"))
+        self.ai_token_var.set(self.TOKEN_MASK if load_ai_token(provider) else "")
+        self.select_ai_reasoning(self.ai_reasoning_var.get())
+
+    def change_ai_provider(self, _event=None):
+        provider = AI_PROVIDER_OPTIONS.get(self.ai_provider_var.get(), "custom")
+        if provider == self._active_ai_provider_mode:
+            return
+        self.remember_ai_profile(self._active_ai_provider_mode)
+        self._active_ai_provider_mode = provider
+        self.store.settings["ai_provider_mode"] = provider
+        self.load_ai_profile(provider)
+        self.refresh_ai_provider()
+        self.ai_settings_status_var.set(
+            "已切换配置；保存后生效。不同提供商的地址、模型和API Key分别保存。")
+
     def refresh_ai_provider(self, _event=None):
-        provider = ai_provider(self.ai_base_url_var.get())
+        provider = self._active_ai_provider_mode
         if provider == "step_plan":
             self.ai_model_entry.pack_forget()
             if not self.ai_model_button.winfo_manager():
@@ -1435,7 +1635,20 @@ class StickyNotesApp:
             self.ai_model_button.pack_forget()
             if not self.ai_model_entry.winfo_manager():
                 self.ai_model_entry.pack(side="left", fill="x", expand=True, ipady=3)
-            self.ai_model_description_var.set("自定义兼容接口：请手动填写服务支持的模型 ID。")
+            if provider == "llama_cpp":
+                self.ai_model_description_var.set(
+                    "本地 llama.cpp：实时回答关闭显式Thinking；会后复盘保留推理。")
+            else:
+                self.ai_model_description_var.set(
+                    "自定义兼容接口：请手动填写服务支持的模型 ID。")
+        if hasattr(self, "llama_runtime_frame"):
+            if provider == "llama_cpp":
+                options = {"fill": "x", "pady": (3, 1)}
+                if hasattr(self, "ai_status"):
+                    options["before"] = self.ai_status
+                self.llama_runtime_frame.pack(**options)
+            else:
+                self.llama_runtime_frame.pack_forget()
 
     def select_ai_model(self, model):
         self.ai_model_var.set(model)
@@ -1499,13 +1712,23 @@ class StickyNotesApp:
         if window is not None and window.winfo_exists():
             window.withdraw()
 
-    def ai_configuration(self):
+    def ai_configuration(self, provider=None):
+        provider = provider or self.store.settings.get("ai_provider_mode", "step_plan")
+        if provider == self.store.settings.get("ai_provider_mode", "step_plan"):
+            base_url = self.store.settings.get("ai_base_url", "")
+            model = self.store.settings.get("ai_model", "")
+            reasoning = self.store.settings.get("ai_reasoning_effort", "low")
+        else:
+            base_url = self.store.settings.get(self.ai_profile_key(provider, "base_url"), "")
+            model = self.store.settings.get(self.ai_profile_key(provider, "model"), "")
+            reasoning = self.store.settings.get(
+                self.ai_profile_key(provider, "reasoning_effort"), "low")
         return {
-            "base_url": self.store.settings.get("ai_base_url", ""),
-            "model": self.store.settings.get("ai_model", ""),
+            "base_url": base_url,
+            "model": model,
             "timeout": self.store.settings.get("ai_timeout", 180),
-            "reasoning_effort": self.store.settings.get("ai_reasoning_effort", "low"),
-            "api_key": load_ai_token(),
+            "reasoning_effort": reasoning,
+            "api_key": load_ai_token(provider),
         }
 
     def clear_ai_token_mask(self, _event=None):
@@ -1513,10 +1736,89 @@ class StickyNotesApp:
             self.ai_token_var.set("")
 
     def restore_ai_token_mask(self, _event=None):
-        if not self.ai_token_var.get().strip() and load_ai_token():
+        if (not self.ai_token_var.get().strip() and
+                load_ai_token(self._active_ai_provider_mode)):
             self.ai_token_var.set(self.TOKEN_MASK)
 
+    @staticmethod
+    def _path_is_on_c_drive(value):
+        try:
+            return Path(value).resolve().drive.upper() == "C:"
+        except (OSError, ValueError):
+            return False
+
+    def choose_llama_executable(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="选择 llama-server.exe",
+            filetypes=[("llama.cpp 服务程序", "llama-server.exe"), ("EXE", "*.exe")])
+        if not path:
+            return
+        if self._path_is_on_c_drive(path):
+            messagebox.showerror("路径不允许", "llama.cpp 服务程序不能放在C盘。", parent=self.root)
+            return
+        self.llama_executable_var.set(path)
+
+    def choose_llama_model(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="选择 GGUF 本地模型",
+            filetypes=[("GGUF模型", "*.gguf")])
+        if not path:
+            return
+        if self._path_is_on_c_drive(path):
+            messagebox.showerror("路径不允许", "GGUF模型不能放在C盘。", parent=self.root)
+            return
+        self.llama_model_path_var.set(path)
+
+    def ensure_local_llama_ready(self, provider="llama_cpp", progress=None):
+        if provider != "llama_cpp":
+            return ""
+        settings = self.store.settings
+        return self.llama_runtime.ensure_ready(
+            executable=settings.get("llama_cpp_executable", ""),
+            model_path=settings.get("llama_cpp_model_path", ""),
+            base_url=settings.get("ai_llama_cpp_base_url", "http://127.0.0.1:8080/v1"),
+            model_alias=settings.get("ai_llama_cpp_model", "qwen3-8b-local"),
+            timeout=settings.get("ai_timeout", 180), progress=progress)
+
+    def _start_local_llama_async(self, notify=False):
+        self.llama_runtime_status_var.set("本地服务：正在检查并加载模型……")
+        if hasattr(self, "llama_start_button"):
+            self.llama_start_button.configure(state="disabled")
+
+        def worker():
+            try:
+                message = self.ensure_local_llama_ready()
+                self.root.after(0, lambda: finish(True, message))
+            except Exception as exc:
+                self.root.after(0, lambda error=str(exc): finish(False, error))
+
+        def finish(success, message):
+            if self.exiting:
+                return
+            if hasattr(self, "llama_start_button"):
+                self.llama_start_button.configure(state="normal")
+            self.llama_runtime_status_var.set(
+                "本地服务：已就绪" if success else "本地服务：启动失败 - " + message)
+            if notify:
+                if success:
+                    messagebox.showinfo("本地大模型", message, parent=self.root)
+                else:
+                    messagebox.showerror("本地大模型启动失败", message, parent=self.root)
+
+        threading.Thread(target=worker, name="llama-runtime-start", daemon=True).start()
+
+    def start_local_llama_from_settings(self):
+        if not self.save_ai_configuration(notify=False):
+            return
+        self._start_local_llama_async(notify=True)
+
+    def autostart_local_llama(self):
+        if self.exiting or not self.store.settings.get("llama_cpp_autostart"):
+            return
+        self._start_local_llama_async(notify=False)
+
     def save_ai_configuration(self, notify=True):
+        provider = self._active_ai_provider_mode
         base_url = self.ai_base_url_var.get().strip().rstrip("/")
         self.refresh_ai_provider()
         model = self.ai_model_var.get().strip()
@@ -1527,18 +1829,34 @@ class StickyNotesApp:
         if token == self.TOKEN_MASK:
             token = ""
         if token:
-            if not save_ai_token(token):
+            if not save_ai_token(token, provider):
                 self.ai_settings_status_var.set("Token写入Windows凭据管理器失败")
                 return False
             self.ai_token_var.set(self.TOKEN_MASK)
-        if not load_ai_token():
-            self.ai_settings_status_var.set("请填写并保存Step Plan API Key")
+        if not load_ai_token(provider):
+            self.ai_settings_status_var.set("请填写并保存API Key；本地接口可使用占位值")
             return False
+        llama_executable = self.llama_executable_var.get().strip()
+        llama_model_path = self.llama_model_path_var.get().strip()
+        if provider == "llama_cpp":
+            if not llama_executable or not llama_model_path:
+                self.ai_settings_status_var.set(
+                    "请选择非C盘的 llama-server.exe 和 GGUF 模型文件")
+                return False
+            if (self._path_is_on_c_drive(llama_executable) or
+                    self._path_is_on_c_drive(llama_model_path)):
+                self.ai_settings_status_var.set("本地大模型程序和模型文件不能位于C盘")
+                return False
+        self.remember_ai_profile(provider)
+        self.store.settings["ai_provider_mode"] = provider
         self.store.settings["ai_base_url"] = base_url
         self.store.settings["ai_model"] = model
         self.store.settings["ai_reasoning_effort"] = self.ai_reasoning_var.get()
         self.store.settings["question_asr_mode"] = QUESTION_ASR_OPTIONS.get(
             self.question_asr_var.get(), "auto")
+        self.store.settings["llama_cpp_executable"] = llama_executable
+        self.store.settings["llama_cpp_model_path"] = llama_model_path
+        self.store.settings["llama_cpp_autostart"] = bool(self.llama_autostart_var.get())
         self.store.save()
         self.ai_settings_status_var.set("")
         if notify:
@@ -1557,6 +1875,7 @@ class StickyNotesApp:
 
         def worker():
             try:
+                self.ensure_local_llama_ready(self._active_ai_provider_mode)
                 reply = stream_chat_completion(self.ai_configuration(), [
                     {"role": "system", "content": "只输出最终答案，不输出思考过程。"},
                     {"role": "user", "content": "请只回复：连接成功"},
@@ -1593,7 +1912,7 @@ class StickyNotesApp:
 
         def worker():
             try:
-                config = self.ai_configuration()
+                config = self.ai_configuration("step_plan")
                 config["timeout"] = 30
                 message = StepAudioASR(config).test_connection()
                 results.put((True, message))
@@ -1612,7 +1931,7 @@ class StickyNotesApp:
                 return
             if success:
                 self.ai_settings_status_var.set(
-                    "StepAudio连接成功；提问助手将优先使用在线识别。")
+                    "StepAudio连接成功；可作为在线识别或本地失败备用。")
             else:
                 mode = self.store.settings.get("question_asr_mode", "auto")
                 fallback = ("；录音时将自动使用SenseVoice本地识别"
@@ -1705,21 +2024,42 @@ class StickyNotesApp:
         question_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         question_frame.grid_columnconfigure(0, weight=1)
         question_enabled_var = tk.BooleanVar(value=True)
+        answer_mode = self.store.settings.get("interview_answer_mode", "hybrid")
+        answer_mode_var = tk.StringVar(
+            value=INTERVIEW_ANSWER_LABELS.get(answer_mode, "智能混合"))
         question_text_var = tk.StringVar(value="录音后将自动识别候选提问，不会自动发送给AI。")
+        recognized_text_var = tk.StringVar(value="最近识别文字：等待会议声音……")
         question_status_var = tk.StringVar(value="")
         tk.Checkbutton(
             question_frame, text="启用准实时提问检测", variable=question_enabled_var,
             bg=c["bg"], fg=c["text"], selectcolor=c["panel"],
             activebackground=c["bg"], activeforeground=c["text"]).grid(
                 row=0, column=0, sticky="w")
+        tk.Label(question_frame, text="回答模式", bg=c["bg"], fg=c["text"]).grid(
+            row=0, column=1, sticky="e", padx=(8, 4))
+        answer_mode_box = ttk.Combobox(
+            question_frame, textvariable=answer_mode_var,
+            values=list(INTERVIEW_ANSWER_OPTIONS), state="readonly", width=11)
+        answer_mode_box.grid(row=0, column=2, sticky="e")
+
+        def save_answer_mode(_event=None):
+            self.store.settings["interview_answer_mode"] = INTERVIEW_ANSWER_OPTIONS.get(
+                answer_mode_var.get(), "hybrid")
+            self.store.save()
+
+        answer_mode_box.bind("<<ComboboxSelected>>", save_answer_mode)
         tk.Label(
             question_frame, textvariable=question_text_var, bg=c["input"], fg=c["text"],
             anchor="w", justify="left", wraplength=620, relief="solid", bd=1,
             padx=7, pady=6).grid(row=1, column=0, columnspan=3, sticky="ew", pady=4)
+        tk.Label(
+            question_frame, textvariable=recognized_text_var, bg=c["bg"], fg=c["muted"],
+            anchor="w", justify="left", wraplength=620).grid(
+                row=2, column=0, columnspan=3, sticky="ew", pady=(1, 4))
         question_actions = tk.Frame(question_frame, bg=c["bg"])
-        question_actions.grid(row=2, column=0, sticky="w")
+        question_actions.grid(row=3, column=0, sticky="w")
         tk.Label(question_frame, textvariable=question_status_var, bg=c["bg"],
-                 fg=c["muted"], anchor="w").grid(row=3, column=0, sticky="ew", pady=(3, 0))
+                 fg=c["muted"], anchor="w").grid(row=4, column=0, sticky="ew", pady=(3, 0))
         if not recording_mode:
             question_frame.grid_remove()
 
@@ -1776,17 +2116,15 @@ class StickyNotesApp:
             question_text_var.set(message)
             question_send_button.state(["disabled"])
             question_ignore_button.state(["disabled"])
+            cloud_answer_button.state(["disabled"])
 
         def ignore_question():
             clear_question("已忽略，继续监听会议方提问……")
             question_status_var.set("")
 
-        def send_question_to_ai():
+        def send_question_to_ai(force_provider=None):
             candidate = state.get("question")
             if not candidate or state["question_answer_busy"]:
-                return
-            if not self.ai_configuration().get("api_key"):
-                messagebox.showinfo("面试提问助手", "请先在设置中保存API Key。", parent=dialog)
                 return
             state["question_answer_busy"] = True
             question_detector.reset_context()
@@ -1794,6 +2132,7 @@ class StickyNotesApp:
             state["answer_timings"] = {}
             set_output("")
             question_send_button.state(["disabled"])
+            cloud_answer_button.state(["disabled"])
             question_status_var.set("正在检索面试知识库……")
             question = candidate["question"]
             context = candidate.get("context", "")
@@ -1806,9 +2145,25 @@ class StickyNotesApp:
                         knowledge = self.interview_knowledge_base.search(
                             f"{question}\n{context}", limit=4)
                     retrieval_elapsed = time.perf_counter() - answer_started
+                    provider, route_reason = (
+                        (force_provider, "用户要求云端重新回答")
+                        if force_provider else choose_interview_answer_provider(
+                            self.store.settings.get("interview_answer_mode", "hybrid"),
+                            candidate.get("terminology_risk") or {}, knowledge.sources))
+                    if provider == "llama_cpp":
+                        live_queue.put(("answer_stage", {
+                            "stage": "runtime", "elapsed": retrieval_elapsed,
+                            "sources": knowledge.sources, "provider": provider,
+                            "route_reason": "正在检查并启动本地大模型"}))
+                        self.ensure_local_llama_ready(provider)
+                    config = self.ai_configuration(provider)
+                    if not config.get("api_key"):
+                        provider_name = "Step Plan云端" if provider == "step_plan" else "本地 llama.cpp"
+                        raise AIServiceError(f"请先在设置中保存{provider_name}的API Key")
                     live_queue.put(("answer_stage", {
                         "stage": "knowledge", "elapsed": retrieval_elapsed,
-                        "sources": knowledge.sources}))
+                        "sources": knowledge.sources, "provider": provider,
+                        "route_reason": route_reason}))
                     first_delta = True
 
                     def receive_delta(delta):
@@ -1820,12 +2175,13 @@ class StickyNotesApp:
                         first_delta = False
 
                     answer = answer_interview_question(
-                        question, context, knowledge.context, self.ai_configuration(),
+                        question, context, knowledge.context, config,
                         knowledge_sources=knowledge.sources,
                         on_delta=receive_delta)
                     live_queue.put(("answer", {
                         "question": question, "answer": answer,
                         "sources": knowledge.sources,
+                        "provider": provider, "route_reason": route_reason,
                         "total_seconds": time.perf_counter() - answer_started,
                         "retrieval_seconds": retrieval_elapsed}))
                 except Exception as exc:
@@ -1840,8 +2196,18 @@ class StickyNotesApp:
         question_ignore_button = ttk.Button(
             question_actions, text="忽略", command=ignore_question)
         question_ignore_button.pack(side="left")
+        cloud_answer_button = ttk.Button(
+            question_actions, text="云端重新回答",
+            command=lambda: send_question_to_ai("step_plan"))
+        cloud_answer_button.pack(side="left", padx=(5, 0))
+        ttk.Button(
+            question_actions, text="编辑术语词典",
+            command=lambda: subprocess.Popen(
+                ["notepad.exe", str(self.interview_terminology.path)])).pack(
+                    side="left", padx=(5, 0))
         question_send_button.state(["disabled"])
         question_ignore_button.state(["disabled"])
+        cloud_answer_button.state(["disabled"])
 
         def poll_live_results():
             if not dialog.winfo_exists():
@@ -1853,6 +2219,16 @@ class StickyNotesApp:
                     break
                 if event == "live_status":
                     question_status_var.set(value)
+                elif event == "live_transcript":
+                    recent = value.get("recent") or "（未识别出文字）"
+                    corrected = value.get("corrected") or recent
+                    combined = value.get("combined") or recent
+                    display = f"最近原始识别片段：{recent}"
+                    if corrected != recent:
+                        display += f"\n术语纠正：{corrected}"
+                    if combined not in (recent, corrected):
+                        display += f"\n当前累计问题（最长75秒）：{combined}"
+                    recognized_text_var.set(display)
                 elif event == "question":
                     value["detected_at"] = time.perf_counter()
                     value["question_id"] = time.time_ns()
@@ -1866,7 +2242,7 @@ class StickyNotesApp:
                     asr_seconds = value.get("asr_seconds")
                     timing = (f" ASR {asr_seconds:.1f}秒；" if asr_seconds is not None else " ")
                     question_status_var.set(
-                        f"语音分段约0.8秒；{timing}可立即发送；知识库正在后台检索。")
+                        f"长问题已完成拼接；{timing}可立即发送；知识库正在后台检索。")
                     question_send_button.state(["!disabled"])
                     question_ignore_button.state(["!disabled"])
 
@@ -1908,13 +2284,16 @@ class StickyNotesApp:
                 elif event == "answer_stage":
                     state["answer_timings"]["retrieval"] = value["elapsed"]
                     sources = value.get("sources") or []
+                    provider_name = ("Step云端" if value.get("provider") == "step_plan"
+                                     else "本地Llama")
+                    route_text = f"{provider_name}（{value.get('route_reason', '')}）"
                     if sources:
                         names = "、".join(Path(source).name for source in sources[:3])
                         question_status_var.set(
-                            f"知识库检索 {value['elapsed']:.2f}秒，命中：{names}；等待AI首字……")
+                            f"{route_text}；知识库检索 {value['elapsed']:.2f}秒，命中：{names}；等待AI首字……")
                     else:
                         question_status_var.set(
-                            f"知识库检索 {value['elapsed']:.2f}秒，无直接命中；等待AI首字……")
+                            f"{route_text}；知识库无直接命中；等待AI首字……")
                 elif event == "answer_delta":
                     if value.get("first"):
                         state["answer_timings"]["first_token"] = value["elapsed"]
@@ -1927,6 +2306,7 @@ class StickyNotesApp:
                     state["answered_question"] = value["question"]
                     state["result"] = value["answer"]
                     state["mode"] = "question_answer"
+                    state["answer_provider"] = value.get("provider")
                     if state["answer_stream"] != value["answer"]:
                         set_output(value["answer"])
                     sources = value.get("sources") or []
@@ -1940,16 +2320,21 @@ class StickyNotesApp:
                         question_status_var.set(
                             f"回答已生成：{timing} 知识库无直接依据，使用通用知识。")
                     question_send_button.state(["!disabled"])
+                    cloud_answer_button.state(
+                        ["disabled"] if value.get("provider") == "step_plan"
+                        else ["!disabled"])
                     for button in result_buttons:
                         button.state(["!disabled"])
                 elif event in ("live_error", "answer_error"):
                     if event == "answer_error":
                         state["question_answer_busy"] = False
                         question_send_button.state(["!disabled"] if state.get("question") else ["disabled"])
+                        cloud_answer_button.state(
+                            ["!disabled"] if state.get("question") else ["disabled"])
                     if event == "answer_error" and state.get("last_sources"):
                         names = "、".join(Path(item).name for item in state["last_sources"][:3])
                         question_status_var.set(
-                            f"知识库已命中：{names}；Step回答失败：{value}")
+                            f"知识库已命中：{names}；AI回答失败：{value}")
                     else:
                         question_status_var.set(("回答失败：" if event == "answer_error" else
                                                  "提问检测暂不可用：") + value)
@@ -2019,6 +2404,8 @@ class StickyNotesApp:
 
             def worker():
                 try:
+                    provider = self.store.settings.get("ai_provider_mode", "step_plan")
+                    self.ensure_local_llama_ready(provider)
                     result = analyzer(
                         task, analysis_text, self.ai_configuration(),
                         status=lambda message: result_queue.put(("status", message)),
@@ -2106,19 +2493,26 @@ class StickyNotesApp:
 
         def run_live_question_detection(recorder):
             mode = self.store.settings.get("question_asr_mode", "auto")
-            cloud_asr = StepAudioASR(self.ai_configuration())
+            cloud_asr = StepAudioASR(self.ai_configuration("step_plan"))
             local_session = None
-            cloud_disabled = mode == "sensevoice"
+            local_disabled = mode == "stepaudio"
             offset = 0
             sequence = 0
             segmenter = MeetingUtteranceSegmenter(
                 recorder.system_rate, recorder.system_channels,
-                silence_seconds=0.8, max_seconds=15.0, overlap_seconds=4.0)
+                # 面试官在长问题中经常会自然停顿 1～2 秒。这里需要把短停顿
+                # 保留在同一个问题窗口内，只有较长静音才认为问题已经结束。
+                silence_seconds=3.5, max_seconds=15.0, overlap_seconds=1.0)
+            continued_chunks = 0
+            max_continued_chunks = 5
+            recognized_parts = []
+            terminology_risk = {
+                "correction_applied": False, "matched_terms": [],
+                "acronyms": [], "unknown_acronyms": []}
 
             def local_transcribe(chunk_path):
                 nonlocal local_session
                 if local_session is None:
-                    live_queue.put(("live_status", "正在加载本地SenseVoice提问检测模型……"))
                     local_session = SenseVoiceLiveSession()
                     local_session.start()
                 segments = local_session.transcribe(chunk_path, "会议方")
@@ -2127,38 +2521,96 @@ class StickyNotesApp:
                     if item.get("text", "").strip())
 
             try:
-                if cloud_disabled:
-                    live_queue.put(("live_status", "提问助手使用SenseVoice本地识别，正在监听会议方音轨。"))
+                if not local_disabled:
+                    live_queue.put(("live_status", "正在预热本地SenseVoice；仅识别会议声音……"))
+                    try:
+                        local_session = SenseVoiceLiveSession()
+                        local_session.start()
+                    except Exception as local_exc:
+                        if mode == "sensevoice":
+                            raise
+                        local_disabled = True
+                        live_queue.put((
+                            "live_status",
+                            f"SenseVoice启动失败，已切换StepAudio在线备用：{local_exc}"))
+                if local_disabled:
+                    live_queue.put(("live_status", "提问助手使用StepAudio在线识别，正在监听会议方音轨。"))
                 else:
-                    live_queue.put(("live_status", "提问助手使用StepAudio在线识别；异常时自动切换SenseVoice本地。"))
+                    live_queue.put(("live_status", "SenseVoice已就绪，仅监听会议声音；麦克风只录制不识别。"))
                 while not live_stop_event.wait(0.2):
                     if recorder.is_paused:
                         continue
                     raw, offset = recorder.read_meeting_audio(offset)
                     if not raw:
                         continue
-                    for utterance in segmenter.feed(raw):
+                    for chunk in segmenter.feed_events(raw):
+                        utterance = chunk.audio
                         sequence += 1
                         chunk_path = recorder.write_live_meeting_chunk(utterance, sequence)
                         asr_started = time.perf_counter()
                         try:
-                            if cloud_disabled:
-                                text = local_transcribe(chunk_path)
+                            if local_disabled:
+                                text = cloud_asr.transcribe_wav(chunk_path)
                             else:
                                 try:
-                                    text = cloud_asr.transcribe_wav(chunk_path)
-                                except Exception as cloud_exc:
-                                    if mode == "stepaudio":
+                                    text = local_transcribe(chunk_path)
+                                except Exception as local_exc:
+                                    if mode == "sensevoice":
                                         raise
-                                    cloud_disabled = True
+                                    local_disabled = True
                                     live_queue.put((
                                         "live_status",
-                                        f"StepAudio不可用，已自动切换SenseVoice本地识别：{cloud_exc}"))
-                                    text = local_transcribe(chunk_path)
-                            candidate = question_detector.add_utterance(text)
+                                        f"SenseVoice不可用，已自动切换StepAudio在线识别：{local_exc}"))
+                                    text = cloud_asr.transcribe_wav(chunk_path)
+                            if not chunk.is_final:
+                                continued_chunks += 1
+                            finalize = (chunk.is_final or
+                                        continued_chunks >= max_continued_chunks)
+                            recent_text = str(text or "").strip()
+                            terminology = self.interview_terminology.correct(recent_text)
+                            corrected_text = terminology["corrected"].strip()
+                            text = corrected_text
+                            for key in ("matched_terms", "acronyms", "unknown_acronyms"):
+                                terminology_risk[key] = list(dict.fromkeys(
+                                    terminology_risk[key] + terminology["risk"].get(key, [])))
+                            terminology_risk["correction_applied"] = (
+                                terminology_risk["correction_applied"] or
+                                terminology["risk"].get("correction_applied", False))
+                            merged_text = corrected_text
+                            if recognized_parts and merged_text:
+                                merged_text = question_detector._remove_overlap(
+                                    recognized_parts[-1], merged_text)
+                            if merged_text:
+                                recognized_parts.append(merged_text)
+                            combined_text = "".join(recognized_parts).strip()
+                            live_queue.put(("live_transcript", {
+                                "recent": recent_text,
+                                "corrected": corrected_text,
+                                "combined": combined_text,
+                                "final": finalize,
+                            }))
+                            candidate = question_detector.add_utterance(
+                                text, finalize=finalize)
+                            if finalize:
+                                continued_chunks = 0
+                                recognized_parts.clear()
                             if candidate:
+                                candidate["terminology_risk"] = dict(terminology_risk)
                                 candidate["asr_seconds"] = time.perf_counter() - asr_started
                                 live_queue.put(("question", candidate))
+                            elif not text:
+                                live_queue.put((
+                                    "live_status", "检测到会议声音，但本段没有识别出文字，继续监听。"))
+                            elif finalize:
+                                live_queue.put((
+                                    "live_status", "已识别一段会议声音，未检测到明确提问，继续监听。"))
+                            else:
+                                live_queue.put((
+                                    "live_status", f"已识别长问题片段 {continued_chunks}，等待问题结束……"))
+                            if finalize:
+                                terminology_risk = {
+                                    "correction_applied": False, "matched_terms": [],
+                                    "acronyms": [], "unknown_acronyms": []}
                         finally:
                             try:
                                 chunk_path.unlink()
@@ -2194,6 +2646,8 @@ class StickyNotesApp:
             status_var.set("正在分别录制麦克风与会议声音。停止后执行完整转写。")
             if recording_mode and question_enabled_var.get():
                 clear_question("正在启动提问助手……")
+                recognized_text_var.set("最近识别文字：正在等待会议声音……")
+                self.interview_terminology.refresh()
                 threading.Thread(
                     target=run_live_question_detection, args=(recorder,),
                     name="live-interview-question-detection", daemon=True).start()
@@ -2478,37 +2932,16 @@ class StickyNotesApp:
 
             dialog.after(80, initialize_voice_display)
 
+
     def toggle_settings(self):
-        self.settings_visible = not self.settings_visible
-        if self.settings_visible:
-            self.section_nav.pack_forget()
-            self.body.pack_forget()
-            self.news_tabs_frame.pack_forget()
-            self.ai_interview_frame.pack_forget()
-            self.clear_toolbar_layout()
-            self.settings_button_text.set("← 返回")
-            self.settings_button.pack(side="right")
-            self.settings_frame.pack(fill="both", expand=True, after=self.toolbar)
-        else:
-            self.settings_frame.pack_forget()
-            self.settings_button_text.set("⚙ 设置")
-            self.section_nav.pack(fill="x", padx=8, pady=(5, 1), after=self.titlebar)
-            self.configure_toolbar_for_section()
-            if self.current_section == "news":
-                self.news_tabs_frame.pack(fill="x", after=self.toolbar)
-                self.body.pack(fill="both", expand=True, padx=8, pady=8,
-                               after=self.news_tabs_frame)
-            else:
-                self.body.pack(fill="both", expand=True, padx=8, pady=8, after=self.toolbar)
-            self.sync_ai_interview_entry()
-            self.root.after_idle(self.adjust_responsive_sash)
+        self.switch_section("settings")
 
     def sync_ai_interview_entry(self):
         self.ai_interview_frame.pack_forget()
         self.news_tabs_frame.pack_forget()
 
     def clear_toolbar_layout(self):
-        buttons = (self.new_button, self.delete_button, self.calendar_button,
+        buttons = (self.new_button, self.delete_button, self.pending_button, self.task_button, self.calendar_button,
                    self.news_refresh_button, self.news_home_button,
                    self.news_source_button, self.record_button, self.settings_button)
         for button in buttons:
@@ -2531,11 +2964,12 @@ class StickyNotesApp:
             self.news_home_button.configure(text="AI HOT" if compact else "打开 AI HOT")
             self.news_source_button.configure(text="原文" if compact else "打开原文")
         self.record_button.configure(text="录音" if compact else "🎙 录音")
+        self.pending_button.configure(text="待办")
+        self.task_button.configure(text="已完成")
 
     def configure_toolbar_for_section(self):
         self.clear_toolbar_layout()
         if self.settings_visible:
-            self.settings_button.pack(side="right")
             return
         self.update_toolbar_labels()
         if self.current_section == "news":
@@ -2546,15 +2980,19 @@ class StickyNotesApp:
                        self.calendar_button, self.settings_button)
         elif self.current_section == "journal":
             buttons = (self.new_button, self.delete_button,
-                       self.record_button, self.settings_button)
+                       self.pending_button, self.task_button, self.record_button)
         else:
-            buttons = (self.new_button, self.delete_button, self.settings_button)
-        for column in range(4):
+            buttons = (self.new_button, self.delete_button,
+                       self.pending_button, self.task_button)
+        for column in range(5):
             self.toolbar.grid_columnconfigure(
                 column, weight=1 if column < len(buttons) else 0,
                 uniform="section-actions" if column < len(buttons) else "")
         for column, button in enumerate(buttons):
             button.grid(row=0, column=column, sticky="ew", padx=2)
+        if self.current_section in ("sticky", "journal"):
+            self.pending_button.state(["selected"] if self.task_view == "pending" else ["!selected"])
+            self.task_button.state(["selected"] if self.task_view == "completed" else ["!selected"])
 
     def sync_check_labels(self):
         self.top_label_var.set(("✔" if self.top_var.get() else "□") + " 置顶")
@@ -2632,7 +3070,7 @@ class StickyNotesApp:
         self.root.after(20, self.sync_quick_visibility)
 
     def add_note(self):
-        if self.current_section == "news":
+        if self.current_section in ("news",):
             return
         self.flush_save()
         if self.current_section == "reminder":
@@ -2873,7 +3311,7 @@ class StickyNotesApp:
             webbrowser.open(self.current_news["source_url"])
 
     def switch_section(self, section: str, select_default: bool = True):
-        if section not in ("reminder", "sticky", "journal", "news"):
+        if section not in ("reminder", "sticky", "journal", "news", "settings"):
             return
         self.flush_save()
         self.current_section = section
@@ -2882,6 +3320,18 @@ class StickyNotesApp:
         self.current_news = None
         self.ai_interview_frame.pack_forget()
         self.show_news_title(section == "news")
+        if section == "settings":
+            self.settings_visible = True
+            self.section_nav.set_active(section)
+            self.clear_toolbar_layout()
+            self.toolbar.pack_forget()
+            self.body.pack_forget()
+            self.news_tabs_frame.pack_forget()
+            self.settings_frame.pack(fill="both", expand=True, after=self.section_nav)
+            return
+        self.settings_visible = False
+        self.settings_frame.pack_forget()
+        self.toolbar.pack(fill="x", after=self.section_nav)
         labels = {"reminder": "＋ 新建提醒", "sticky": "＋ 新建便签",
                   "journal": "＋ 新建笔记", "news": "新闻"}
         self.new_button_text.set(labels[section])
@@ -2889,24 +3339,19 @@ class StickyNotesApp:
 
         # 先清空各板块的附属控件，再按目标板块重建，确保重复调用也安全。
         self.reminder_actions.pack_forget()
-        self.learning_actions.pack_forget()
         self.note_filter_frame.pack_forget()
-        self.reminder_frame.pack_forget()
-        self.reminder_hint.pack_forget()
         self.calendar_button.pack_forget()
         self.configure_toolbar_for_section()
+        self.body.pack_forget()
+        self.body.pack(fill="both", expand=True, padx=8, pady=8, after=self.toolbar)
         if section == "reminder":
-            self.reminder_frame.pack(fill="x")
-            self.reminder_hint.pack(fill="x", padx=10, pady=(0, 8))
-            self.reminder_actions.pack(fill="x", before=self.reminder_frame)
+            self.reminder_actions.pack(fill="x")
         elif section == "journal":
             self.category_filter.configure(values=["全部分类", "未分类"] + self.store.categories)
             self.note_filter_frame.pack(fill="x", before=self.listbox)
-            self.learning_actions.pack(fill="x")
             self.sync_ai_interview_entry()
         elif section == "sticky":
-            self.reminder_frame.pack(fill="x")
-            self.reminder_hint.pack(fill="x", padx=10, pady=(0, 8))
+            pass
         self.apply_theme(save=False)
         self.refresh_list()
         if section == "news":
@@ -3006,6 +3451,37 @@ class StickyNotesApp:
             self.root.after_idle(lambda value=result["open_ai"]:
                                  self.open_ai_interview(value, show_recording=False))
 
+    def enable_dialog_dpi_scaling(self, dialog, base_min_size):
+        """让独立弹窗随所在显示器的 DPI 同步字体、间距和最小尺寸。"""
+        scaler = WindowDpiScaler(
+            dialog, user_factor=UI_FONT_SCALINGS.get(self.ui_font_size, 1.0),
+            base_min_size=base_min_size)
+        dialog._dpi_scaler = scaler  # 保持缩放器和字体对象的生命周期。
+        refresh_job = None
+
+        def refresh_dpi():
+            nonlocal refresh_job
+            refresh_job = None
+            if not dialog.winfo_exists():
+                return
+            display = display_for_bounds(window_bounds(dialog), enumerate_displays())
+            if display and display.dpi != scaler.current_dpi:
+                scaler.apply(display.dpi)
+
+        def schedule_refresh(_event=None):
+            nonlocal refresh_job
+            if refresh_job:
+                try:
+                    dialog.after_cancel(refresh_job)
+                except tk.TclError:
+                    pass
+            # 等待窗口实际跨入目标屏幕后再读取 DPI，避免拖动过程反复缩放。
+            refresh_job = dialog.after(80, refresh_dpi)
+
+        dialog.bind("<Configure>", schedule_refresh, add="+")
+        dialog.after_idle(refresh_dpi)
+        return scaler
+
     def open_note_dialog(self, note: Optional[Dict] = None, kind: str = "sticky"):
         c = self.colors
         dialog = tk.Toplevel(self.root)
@@ -3040,6 +3516,10 @@ class StickyNotesApp:
                                 relief="flat", bd=0, padx=10, pady=3,
                                 font=("Microsoft YaHei UI", 9, "bold"))
         bold_button.pack(side="right")
+        task_button = tk.Button(content_header, text="☐/☑ 完成", bg=c["panel"], fg=c["text"],
+                                activebackground=c["accent"], activeforeground="white",
+                                relief="flat", bd=0, padx=10, pady=3)
+        task_button.pack(side="right", padx=(0, 6))
 
         content = tk.Text(form, bg=c["input"], fg=c["text"], insertbackground=c["text"],
                           relief="solid", bd=1, wrap="word", undo=True,
@@ -3048,6 +3528,7 @@ class StickyNotesApp:
         content.tag_configure("bold", font=("Microsoft YaHei UI", 11, "bold"))
         content.insert("1.0", (note or {}).get("content", ""))
         self.apply_format_ranges(content, (note or {}).get("formats", []))
+        self.configure_task_checklist(content)
 
         source_reminder = next((r for r in self.store.reminders
                                 if note and r.get("source_id") == note.get("id")), None)
@@ -3281,6 +3762,7 @@ class StickyNotesApp:
             return "break"
 
         bold_button.configure(command=toggle_bold)
+        task_button.configure(command=lambda: self.toggle_task_line(content))
         content.bind("<KeyPress>", on_keypress, add="+")
         content.bind("<Control-b>", toggle_bold)
         content.bind("<Control-B>", toggle_bold)
@@ -3314,6 +3796,7 @@ class StickyNotesApp:
         tk.Button(actions, text="保存", command=save_dialog, bg=c["accent"], fg="white",
                   relief="flat", padx=18, pady=5).pack(side="right", padx=(0, 8))
 
+        self.enable_dialog_dpi_scaling(dialog, base_min_size=(560, 470))
         dialog.grab_set()
         title_entry.focus_set()
         dialog.wait_window()
@@ -3395,6 +3878,7 @@ class StickyNotesApp:
         tk.Button(actions, text="保存", command=save, bg=c["accent"], fg="white",
                   relief="flat", padx=18, pady=5).pack(side="right", padx=8)
         dialog.bind("<Escape>", lambda _e: close())
+        self.enable_dialog_dpi_scaling(dialog, base_min_size=(480, 380))
         dialog.grab_set()
         title.focus_set()
         dialog.wait_window()
@@ -3459,6 +3943,7 @@ class StickyNotesApp:
                   relief="flat", padx=16, pady=5).pack(side="right")
         tk.Button(actions, text="保存规则", command=save, bg=c["accent"], fg="white",
                   relief="flat", padx=16, pady=5).pack(side="right", padx=8)
+        self.enable_dialog_dpi_scaling(dialog, base_min_size=(470, 360))
         dialog.grab_set(); dialog.wait_window()
         if parent.winfo_exists():
             parent.grab_set()
@@ -3502,8 +3987,221 @@ class StickyNotesApp:
                          "<Control-Shift-z>", "<Control-Shift-Z>"):
             text_widget.bind(sequence, self.redo_text)
 
+    @staticmethod
+    def toggled_task_line(line: str) -> str:
+        """将一行普通文本转为待办，或在未完成/已完成之间切换。"""
+        if line.startswith("☐ "):
+            return "☑ " + line[2:]
+        if line.startswith("☑ "):
+            return "☐ " + line[2:]
+        return "☐ " + line
+
+    @staticmethod
+    def split_completed_task_blocks(content: str):
+        """提取已勾选任务及其后续说明，保留未完成任务和普通正文。"""
+        lines = content.splitlines(keepends=True)
+        remaining, completed = [], []
+        index = 0
+        while index < len(lines):
+            if lines[index].startswith("☑ "):
+                block = [lines[index]]
+                index += 1
+                while index < len(lines) and not lines[index].startswith(("☐ ", "☑ ")):
+                    block.append(lines[index])
+                    index += 1
+                completed.append("".join(block).strip())
+                continue
+            remaining.append(lines[index])
+            index += 1
+        return "".join(remaining).strip(), completed
+
+    def set_task_view(self, view):
+        if self.current_section not in ("sticky", "journal"):
+            return
+        self.task_view = view
+        self.pending_button.state(["selected"] if view == "pending" else ["!selected"])
+        self.task_button.state(["selected"] if view == "completed" else ["!selected"])
+        self.apply_task_view()
+
+    def apply_task_view(self):
+        """在主界面按任务状态隐藏整段内容；完整正文仍保留，编辑请双击标题。"""
+        if not self.current or self.current_section not in ("sticky", "journal"):
+            return
+        self.editor.configure(state="normal")
+        self.editor.tag_remove("task_hidden", "1.0", "end")
+        last_line = int(self.editor.index("end-1c").split(".")[0])
+        task_lines = []
+        for line in range(1, last_line + 1):
+            prefix = self.editor.get(f"{line}.0", f"{line}.2")
+            if prefix in ("☐ ", "☑ "):
+                task_lines.append((line, prefix == "☑ "))
+        if self.task_view == "completed":
+            if task_lines:
+                self.editor.tag_add("task_hidden", "1.0", f"{task_lines[0][0]}.0")
+            else:
+                self.editor.tag_add("task_hidden", "1.0", "end")
+        for index, (line, completed) in enumerate(task_lines):
+            end = f"{task_lines[index + 1][0]}.0" if index + 1 < len(task_lines) else "end"
+            hide = completed if self.task_view == "pending" else not completed
+            if hide:
+                self.editor.tag_add("task_hidden", f"{line}.0", end)
+        self.editor.tag_configure("task_hidden", elide=True)
+
+    def archive_current_task_line(self, line_number):
+        """将主界面中当前任务块归档，并从原正文中移除。"""
+        if not self.current or self.current_section not in ("sticky", "journal"):
+            return
+        try:
+            start = f"{line_number}.0"
+            last_line = int(self.editor.index("end-1c").split(".")[0])
+            next_line = line_number + 1
+            while next_line <= last_line:
+                prefix = self.editor.get(f"{next_line}.0", f"{next_line}.2")
+                if prefix in ("☐ ", "☑ "):
+                    break
+                next_line += 1
+            end = f"{next_line}.0" if next_line <= last_line else "end-1c"
+            task_content = self.editor.get(start, end).strip()
+            if not task_content.startswith("☐ "):
+                return
+            self.store.archive_completed_task(
+                self.current_section, self.current.get("id", ""),
+                self.title_var.get(), "☑ " + task_content[2:])
+            self.editor.delete(start, end)
+            self.refresh_task_checklist(self.editor)
+            self.status_var.set("已归档到“已完成”")
+        except tk.TclError:
+            return
+
+    def save_completed_task_blocks(self, note, kind, task_blocks):
+        for task_content in task_blocks or []:
+            self.store.archive_completed_task(
+                kind, note.get("id", ""), note.get("title", "无标题"), task_content)
+
+    def open_completed_tasks(self):
+        """打开当前便签或笔记板块的已完成归档卡片。"""
+        kind = self.current_section if self.current_section in ("sticky", "journal") else "sticky"
+        title = "已完成便签" if kind == "sticky" else "已完成笔记"
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("620x460")
+        dialog.minsize(480, 340)
+        dialog.configure(bg=self.colors["bg"])
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", self.top_var.get())
+        frame = tk.Frame(dialog, bg=self.colors["bg"], padx=14, pady=14)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text=title, bg=self.colors["bg"], fg=self.colors["text"],
+                 font=("Microsoft YaHei UI", 14, "bold"), anchor="w").pack(fill="x")
+        tk.Label(frame, text="已勾选任务会自动归档在这里。", bg=self.colors["bg"],
+                 fg=self.colors["muted"], anchor="w").pack(fill="x", pady=(2, 8))
+        body = tk.PanedWindow(frame, orient="horizontal", sashwidth=5, bd=0, relief="flat")
+        body.pack(fill="both", expand=True)
+        task_list = tk.Listbox(body, bg=self.colors["panel"], fg=self.colors["text"],
+                               selectbackground=self.colors["accent"], activestyle="none")
+        detail = tk.Text(body, bg=self.colors["input"], fg=self.colors["text"],
+                         wrap="word", relief="solid", bd=1, padx=10, pady=8)
+        detail.configure(state="disabled")
+        body.add(task_list, minsize=150)
+        body.add(detail, minsize=260)
+        records = [record for record in self.store.completed_tasks if record.get("kind") == kind]
+        for record in records:
+            when = record.get("completed_at", "").replace("T", " ")[:16]
+            task_list.insert("end", f"✓ {record.get('source_title', '无标题')[:12]} · {when}")
+
+        def show_record(_event=None):
+            selected = task_list.curselection()
+            if not selected:
+                return
+            record = records[selected[0]]
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            detail.insert("1.0", f"来源：{record.get('source_title', '无标题')}\n"
+                          f"完成时间：{record.get('completed_at', '').replace('T', ' ')}\n\n"
+                          f"{record.get('content', '')}")
+            detail.configure(state="disabled")
+
+        task_list.bind("<<ListboxSelect>>", show_record)
+        if records:
+            task_list.selection_set(0)
+            show_record()
+        self.enable_dialog_dpi_scaling(dialog, base_min_size=(480, 340))
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+
+    def refresh_task_checklist(self, text_widget: tk.Text):
+        """依据正文中的任务标记更新完成项的视觉样式和可点击区域。"""
+        try:
+            text_widget.tag_remove("task_marker", "1.0", "end")
+            text_widget.tag_remove("task_done", "1.0", "end")
+            last_line = int(text_widget.index("end-1c").split(".")[0])
+            for line_number in range(1, last_line + 1):
+                start = f"{line_number}.0"
+                prefix = text_widget.get(start, f"{line_number}.2")
+                if prefix in ("☐ ", "☑ "):
+                    text_widget.tag_add("task_marker", start, f"{line_number}.1")
+                    if prefix == "☑ ":
+                        text_widget.tag_add("task_done", f"{line_number}.2",
+                                            f"{line_number}.end")
+        except tk.TclError:
+            return
+
+    def configure_task_checklist(self, text_widget: tk.Text):
+        """为正文编辑器配置待办点击和完成样式；任务状态仍保存为普通正文。"""
+        if getattr(text_widget, "_task_checklist_configured", False):
+            self.refresh_task_checklist(text_widget)
+            return
+        text_widget._task_checklist_configured = True
+        text_widget.tag_configure("task_marker", foreground=self.colors["accent"], underline=1)
+        text_widget.tag_configure("task_done", foreground=self.colors["muted"], overstrike=1)
+
+        def toggle_clicked_marker(event):
+            index = text_widget.index(f"@{event.x},{event.y}")
+            line_number, column = (int(value) for value in index.split("."))
+            if column <= 1:
+                prefix = text_widget.get(f"{line_number}.0", f"{line_number}.2")
+                complete_handler = getattr(text_widget, "_complete_task_handler", None)
+                if prefix == "☐ " and complete_handler:
+                    complete_handler(line_number)
+                    return "break"
+                self.toggle_task_line(text_widget, line_number)
+                return "break"
+            return None
+
+        text_widget.tag_bind("task_marker", "<Button-1>", toggle_clicked_marker)
+        text_widget.bind("<KeyRelease>",
+                         lambda _event: text_widget.after_idle(
+                             lambda: self.refresh_task_checklist(text_widget)), add="+")
+        self.refresh_task_checklist(text_widget)
+
+    def toggle_task_line(self, text_widget: tk.Text, line_number=None):
+        """切换光标所在行的待办状态；普通行首次点击会转为未完成待办。"""
+        try:
+            line_number = line_number or int(text_widget.index("insert").split(".")[0])
+            start, end = f"{line_number}.0", f"{line_number}.end"
+            original = text_widget.get(start, end)
+            text_widget.delete(start, end)
+            text_widget.insert(start, self.toggled_task_line(original))
+            text_widget.edit_separator()
+            self.refresh_task_checklist(text_widget)
+            text_widget.mark_set("insert", start)
+            text_widget.focus_set()
+            if text_widget is self.editor:
+                self.apply_task_view()
+                self.schedule_save()
+        except tk.TclError:
+            return
+
+    def toggle_current_task(self):
+        if self.current_section in ("sticky", "journal") and self.current:
+            line_number = int(self.editor.index("insert").split(".")[0])
+            prefix = self.editor.get(f"{line_number}.0", f"{line_number}.2")
+            if prefix == "☐ ":
+                self.archive_current_task_line(line_number)
+            else:
+                self.toggle_task_line(self.editor, line_number)
+
     def delete_note(self):
-        if self.current_section == "news":
+        if self.current_section in ("news",):
             return
         if self.current_section == "reminder":
             if not self.current_reminder:
@@ -3577,6 +4275,8 @@ class StickyNotesApp:
                 prefix = f"[{note.get('category')}] " if self.current_section == "journal" and note.get("category") else ""
                 title = prefix + (note.get("title") or "无标题").strip().replace("\n", " ")[:16]
                 self.listbox.insert("end", title + mark)
+        # Listbox 的 height 单位是行数；刷新、新建、删除或筛选后都会重新计算。
+        self.listbox.configure(height=max(1, len(items)))
         if selected_id:
             for index, item in enumerate(items):
                 identity = item.get("permalink") if self.current_section == "news" else item.get("id")
@@ -3603,7 +4303,9 @@ class StickyNotesApp:
         self.editor.insert("1.0", note.get("content", ""))
         self.editor.tag_remove("bold", "1.0", "end")
         self.apply_format_ranges(self.editor, note.get("formats", []))
+        self.refresh_task_checklist(self.editor)
         self.editor.edit_modified(False)
+        self.apply_task_view()
         source_reminder = next((r for r in self.store.reminders
                                 if r.get("source_id") == note_id), None)
         self.reminder_var.set((source_reminder or {}).get("remind_at", ""))
@@ -3920,6 +4622,7 @@ class StickyNotesApp:
             except Exception:
                 pass
             self.voice_recorder = None
+        self.llama_runtime.stop_owned()
         self.reveal_from_edge()
         self.flush_save()
         if self.root.state() == "normal":
@@ -3944,6 +4647,7 @@ class StickyNotesApp:
             except Exception:
                 pass
             self.voice_recorder = None
+        self.llama_runtime.stop_owned()
         self.reveal_from_edge()
         self.flush_save()
         if self.root.state() == "normal":

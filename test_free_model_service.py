@@ -71,8 +71,8 @@ class FreeModelServiceTests(unittest.TestCase):
 
         app = StickyNotesApp.__new__(StickyNotesApp)
         app.current_section = "news"
-        names = ("title_entry", "reminder_frame", "reminder_hint", "reminder_actions",
-                 "learning_actions", "note_filter_frame", "ai_interview_frame")
+        names = ("title_entry", "reminder_actions",
+                 "note_filter_frame", "ai_interview_frame")
         widgets = []
         for name in names:
             widget = FakeWidget()
