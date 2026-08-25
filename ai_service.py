@@ -76,19 +76,27 @@ MEETING_TASKS = {
     "minutes": (
         "生成会议纪要",
         "请按以下固定模板生成结构化会议纪要：一、会议概览（主题、时间、参会角色，"
-        "未提及则标记“待确认”）；二、核心结论；三、按议题整理的讨论摘要；四、已确认决策；"
+        "未提及则标记\"待确认\"）；二、核心结论；三、按议题整理的讨论摘要；四、已确认决策；"
         "五、行动项表格（任务、负责人、截止时间、优先级）；六、风险与阻塞；七、待确认事项；"
         "八、下次会议建议。只依据原文，不得补写原文没有的姓名、日期、结论或任务。",
     ),
     "actions": (
         "提取决策与行动项",
         "请提取会议中明确形成的决策和行动项。行动项使用表格输出：任务、负责人、截止时间、"
-        "优先级、原文依据。任何原文没有明确说明的字段标记为“待确认”，不得推测负责人或期限。",
+        "优先级、原文依据。任何原文没有明确说明的字段标记为\"待确认\"，不得推测负责人或期限。",
     ),
     "risks": (
         "提取风险与待确认事项",
         "请整理会议中的分歧、风险、阻塞问题、尚未解决的问题和下次会议需确认事项。每项注明"
-        "对应原文依据，并区分“已确认事实”和“讨论中的观点”，不得将建议写成已确认决策。",
+        "对应原文依据，并区分\"已确认事实\"和\"讨论中的观点\"，不得将建议写成已确认决策。",
+    ),
+}
+
+TRANSCRIPT_TASKS = {
+    "summary": (
+        "生成内容摘要",
+        "请生成结构化摘要，包含：核心主题、关键要点、重要结论、待确认事项，以及200至400字综合摘要。"
+        "只依据原文；缺失信息标记为\"未提及\"。摘要要忠实原文，不得虚构或推测。",
     ),
 }
 
@@ -333,6 +341,49 @@ def analyze_meeting(task: str, text: str, config: Dict,
         ], cancelled, max_tokens=1800))
     if status:
         status("正在合并会议分段结果……")
+    merged = "\n\n".join(f"【第{i}段】\n{part}" for i, part in enumerate(partials, 1))
+    return stream_chat_completion(config, [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"请根据以下分段提取结果完成任务：{instruction}\n\n{merged}"},
+    ], cancelled)
+
+
+def analyze_transcript(task: str, text: str, config: Dict,
+                       status: Optional[Callable[[str], None]] = None,
+                       cancelled=None) -> str:
+    if task not in TRANSCRIPT_TASKS:
+        raise AIServiceError("未知的转写摘要任务")
+    title, instruction = TRANSCRIPT_TASKS[task]
+    chunks = chunk_interview_text(text)
+    if not chunks:
+        raise AIServiceError("当前笔记没有可分析的正文")
+    system = (
+        "你是严谨的中文内容摘要助手。只允许依据用户提供的转写稿整理，不得编造事实、数据或结论。"
+        "原始素材有模糊、缺失或不确定之处时统一标记为\\\"未提及\\\"，不得推测或补写。"
+        "只输出最终结果，不输出思考过程。"
+    )
+    if len(chunks) == 1:
+        if status:
+            status(f"正在{title}……")
+        return stream_chat_completion(config, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"任务：{instruction}\n\n转写稿：\n{chunks[0]}"},
+        ], cancelled)
+
+    partials = []
+    for index, chunk in enumerate(chunks, 1):
+        if cancelled and cancelled.is_set():
+            raise AIServiceError("已取消生成")
+        if status:
+            status(f"正在分析第 {index}/{len(chunks)} 段……")
+        partials.append(stream_chat_completion(config, [
+            {"role": "system", "content": system},
+            {"role": "user", "content":
+             f"这是完整转写稿的第{index}/{len(chunks)}段。请仅提取与最终任务相关的事实和关键点。\n"
+             f"最终任务：{instruction}\n\n本段转写：\n{chunk}"},
+        ], cancelled, max_tokens=1800))
+    if status:
+        status("正在合并分段结果……")
     merged = "\n\n".join(f"【第{i}段】\n{part}" for i, part in enumerate(partials, 1))
     return stream_chat_completion(config, [
         {"role": "system", "content": system},

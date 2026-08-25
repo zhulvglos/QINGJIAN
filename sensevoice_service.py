@@ -31,6 +31,14 @@ class SenseVoiceTranscriber:
     def worker_path(self) -> Path:
         return self.runtime_root / "sensevoice_worker.py"
 
+    @staticmethod
+    def _safe_exists(path) -> bool:
+        """安全地检查路径是否存在，处理 Windows 联接点等不可信路径。"""
+        try:
+            return Path(path).exists()
+        except (OSError, PermissionError):
+            return False
+
     def model_status(self) -> Dict:
         required = {
             "独立环境": self.python_path,
@@ -39,7 +47,8 @@ class SenseVoiceTranscriber:
             "FSMN-VAD": self.runtime_root / "models" / "fsmn-vad" / "model.pt",
             "CAM++": self.runtime_root / "models" / "campplus-speaker" / "campplus_cn_common.bin",
         }
-        missing = [name for name, path in required.items() if not path.exists()]
+        missing = [name for name, path in required.items()
+                   if not self._safe_exists(path)]
         return {"ready": not missing, "missing": missing, "paths": required}
 
     def _validate(self):

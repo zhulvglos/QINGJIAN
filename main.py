@@ -14,7 +14,7 @@ import webbrowser
 from datetime import date, datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, Optional
-from PIL import Image
+from PIL import Image, ImageTk
 
 from calendar_picker import CalendarPicker
 from dpi_scaler import WindowDpiScaler
@@ -22,9 +22,10 @@ from display_manager import (DisplayArea, EdgeHideController, detect_docked_edge
                              display_for_bounds, enable_per_monitor_dpi_awareness,
                              ensure_visible_position, enumerate_displays,
                              set_window_position, window_bounds)
-from ai_service import (AIServiceError, INTERVIEW_TASKS, MEETING_TASKS,
+from ai_service import (AIServiceError, INTERVIEW_TASKS, MEETING_TASKS, TRANSCRIPT_TASKS,
                         REASONING_EFFORTS, STEP_PLAN_MODELS,
-                        analyze_interview, analyze_meeting, answer_interview_question,
+                        analyze_interview, analyze_meeting, analyze_transcript,
+                        answer_interview_question,
                         choose_interview_answer_provider, stream_chat_completion)
 from storage import NoteStore
 from sensevoice_service import SenseVoiceLiveSession, SenseVoiceTranscriber
@@ -234,10 +235,10 @@ class StickyNotesApp:
         self.flash_cache_path = self.store.path.parent / "free_models_cache.json"
         self.news_mode = "daily"
         self.interview_knowledge_base = InterviewKnowledgeBase(
-            Path(__file__).resolve().parent / "面试知识库",
+            Path(__file__).resolve().parent / "录音回答知识库",
             self.store.path.parent / "interview_kb_index.json")
         self.interview_terminology = InterviewTerminology(
-            Path(__file__).resolve().parent / "面试知识库" / "AI技术术语词典.md")
+            Path(__file__).resolve().parent / "录音回答知识库" / "AI技术术语词典.md")
         self.llama_runtime = LlamaRuntimeManager(
             Path(__file__).resolve().parent / "logs")
         self.news_items = []
@@ -405,6 +406,14 @@ class StickyNotesApp:
         style = ttk.Style()
         style.theme_use("clam")
         self.style = style
+
+        # 图片皮肤的底层画布必须先创建，后续控件才能自然叠加在背景图片之上。
+        self.background_canvas = tk.Canvas(
+            self.root, bd=0, highlightthickness=0, relief="flat")
+        self.background_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.background_photo = None
+        self.background_image_id = None
+        self.background_canvas.bind("<Configure>", self._redraw_background_image)
 
         self.titlebar = tk.Frame(self.root, height=34, padx=8)
         self.titlebar.pack(fill="x")
@@ -694,7 +703,10 @@ class StickyNotesApp:
         ai_settings.bind("<Configure>", self.update_ai_description_wrap, add="+")
         self.refresh_ai_provider()
         self.select_ai_reasoning(self.ai_reasoning_var.get())
-        voice_status = SenseVoiceTranscriber().model_status()
+        try:
+            voice_status = SenseVoiceTranscriber().model_status()
+        except Exception:
+            voice_status = {"ready": False, "missing": ["独立环境"]}
         asr_row = tk.Frame(ai_settings)
         asr_row.pack(fill="x", pady=2)
         self.bg_widgets.append(asr_row)
@@ -1458,6 +1470,7 @@ class StickyNotesApp:
         self.colors = palette if isinstance(palette, dict) else THEMES.get(self.theme_name, THEMES["黄色"])
         c = self.colors
         self.root.configure(bg=c["bg"])
+        self._redraw_background_image()
         for widget in self.bg_widgets:
             widget.configure(bg=c["bg"])
         for widget in self.panel_widgets:
@@ -1555,6 +1568,42 @@ class StickyNotesApp:
             self.apply_theme()
             return
         self.store.save()
+
+    def _redraw_background_image(self, _event=None):
+        """按窗口比例裁切并绘制图片皮肤；无图片时仅保留纯色背景。"""
+        if not hasattr(self, "background_canvas"):
+            return
+        canvas = self.background_canvas
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+
+        canvas.configure(bg=self.colors["bg"])
+        canvas.delete("background_image")
+        self.background_photo = None
+        image_path = self.store.settings.get("background_image", "")
+        if self.theme_name != "图片皮肤" or not image_path:
+            return
+        try:
+            image = Image.open(image_path).convert("RGB")
+            source_width, source_height = image.size
+            scale = max(width / source_width, height / source_height)
+            resized = image.resize(
+                (max(width, round(source_width * scale)),
+                 max(height, round(source_height * scale))),
+                Image.Resampling.LANCZOS)
+            left = max(0, (resized.width - width) // 2)
+            top = max(0, (resized.height - height) // 2)
+            resized = resized.crop((left, top, left + width, top + height))
+            self.background_photo = ImageTk.PhotoImage(resized)
+            self.background_image_id = canvas.create_image(
+                width // 2, height // 2, image=self.background_photo,
+                anchor="center", tags="background_image")
+            canvas.lower(self.background_image_id)
+        except (OSError, ValueError, tk.TclError):
+            # 图片丢失或格式不可读时回退到已提取的纯色调色板。
+            self.background_photo = None
 
     @staticmethod
     def image_skin_palette(image):
@@ -1947,14 +1996,17 @@ class StickyNotesApp:
                           source_text=None):
         recording_mode = review_type == "recording"
         is_meeting = review_type == "meeting"
+        is_summary = review_type == "summary"
         dialog_name = ("录音转写" if recording_mode else
+                       "摘要生成" if is_summary else
                        "AI会议总结" if is_meeting else "AI面试复盘")
-        tasks = {} if recording_mode else (MEETING_TASKS if is_meeting else INTERVIEW_TASKS)
-        analyzer = None if recording_mode else (analyze_meeting if is_meeting else analyze_interview)
+        tasks = {} if recording_mode else (TRANSCRIPT_TASKS if is_summary else (
+            MEETING_TASKS if is_meeting else INTERVIEW_TASKS))
+        analyzer = None if recording_mode or is_summary else (analyze_meeting if is_meeting else analyze_interview)
         if show_recording is None:
             show_recording = recording_mode
         if self.current_section != "journal" or not self.current:
-            if not recording_mode and source_text is None:
+            if not recording_mode and not is_summary and source_text is None:
                 messagebox.showinfo(dialog_name, "请先选择一篇需要分析的笔记。", parent=self.root)
                 return
             source_id = None
@@ -1975,18 +2027,28 @@ class StickyNotesApp:
         dialog = tk.Toplevel(self.root)
         self.ai_dialog = dialog
         dialog.title(dialog_name)
+        # V2 起录音窗口不再使用旧版 DPI 换算后的尺寸。旧缓存曾在跨屏时把
+        # 960×983 的窗口缩小到 640×560，挤掉录音和底部操作区。
+        voice_layout_version = int(self.store.settings.get("voice_dialog_layout_version", 0) or 0)
         saved_voice_bounds = self.store.settings.get("voice_dialog_bounds")
-        if (recording_mode and isinstance(saved_voice_bounds, list) and
-                len(saved_voice_bounds) == 4):
+        if (recording_mode and voice_layout_version >= 2 and
+                isinstance(saved_voice_bounds, list) and len(saved_voice_bounds) == 4):
             dialog.geometry(
-                f"{max(640, int(saved_voice_bounds[2]))}x{max(560, int(saved_voice_bounds[3]))}")
+                f"{max(800, int(saved_voice_bounds[2]))}x{max(720, int(saved_voice_bounds[3]))}")
         else:
-            dialog.geometry("800x720")
-        dialog.minsize(640, 560)
+            # 以完整录音流程为基准：设备、录音提问助手、转写/摘要和底部保存操作
+            # 必须同时可见，不能让输出框挤占这些操作区。
+            dialog.geometry("960x820")
+        dialog.minsize(800, 720)
         dialog.configure(bg=c["bg"])
         dialog.transient(self.root)
         dialog.attributes("-topmost", self.top_var.get())
-        dialog.grid_rowconfigure(3, weight=1)
+        dialog.grid_rowconfigure(0, minsize=42)
+        dialog.grid_rowconfigure(1, minsize=236)
+        dialog.grid_rowconfigure(2, minsize=42)
+        dialog.grid_rowconfigure(3, weight=1, minsize=160)
+        dialog.grid_rowconfigure(4, minsize=28)
+        dialog.grid_rowconfigure(5, minsize=40)
         dialog.grid_columnconfigure(0, weight=1)
 
         tk.Label(dialog, text=dialog_name, bg=c["bg"], fg=c["text"],
@@ -2019,7 +2081,7 @@ class StickyNotesApp:
         record_controls.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
         question_frame = tk.LabelFrame(
-            record_frame, text="面试提问助手（仅分析会议方音轨）",
+            record_frame, text="录音提问助手（仅分析会议方音轨）",
             bg=c["bg"], fg=c["text"], padx=7, pady=6)
         question_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         question_frame.grid_columnconfigure(0, weight=1)
@@ -2070,10 +2132,11 @@ class StickyNotesApp:
 
         output = tk.Text(dialog, bg=c["input"], fg=c["text"], insertbackground=c["text"],
                          wrap="word", relief="solid", bd=1,
-                         font=("Microsoft YaHei UI", 10), padx=10, pady=10)
+                         font=("Microsoft YaHei UI", 10), padx=10, pady=10,
+                         height=10)
         output.grid(row=3, column=0, sticky="nsew", padx=16)
         output.configure(state="disabled")
-        initial_status = ("可开始录音或导入音频，转写后再选择面试复盘或会议总结。"
+        initial_status = ("可开始录音或导入音频，转写后可查看转写内容或生成内容摘要。"
                           if recording_mode else "请选择一项 AI 分析任务。")
         status_var = tk.StringVar(value=initial_status)
         tk.Label(dialog, textvariable=status_var, bg=c["bg"], fg=c["muted"],
@@ -2133,7 +2196,7 @@ class StickyNotesApp:
             set_output("")
             question_send_button.state(["disabled"])
             cloud_answer_button.state(["disabled"])
-            question_status_var.set("正在检索面试知识库……")
+            question_status_var.set("正在检索知识库……")
             question = candidate["question"]
             context = candidate.get("context", "")
             answer_started = time.perf_counter()
@@ -2346,7 +2409,6 @@ class StickyNotesApp:
             state["busy"] = busy
             for button in task_buttons:
                 button.state(["disabled"] if busy else ["!disabled"])
-            cancel_button.state(["!disabled"] if busy else ["disabled"])
             for button in result_buttons:
                 button.state(["disabled"] if busy or not state["result"] else ["!disabled"])
 
@@ -2418,13 +2480,34 @@ class StickyNotesApp:
             threading.Thread(target=worker, name=thread_name, daemon=True).start()
             dialog.after(100, poll_results)
 
+        def show_transcript():
+            """在输出区显示已经完成的录音转写内容。"""
+            transcript = state["result"].strip()
+            if not transcript:
+                messagebox.showinfo("录音转写", "请先完成录音转写或导入音频。", parent=dialog)
+                return
+            state["mode"] = "transcript"
+            set_output(transcript)
+            status_var.set("转写内容已显示。")
+
+        def generate_summary():
+            """将当前录音转写交给摘要生成窗口。"""
+            transcript = state["result"].strip()
+            if not transcript:
+                messagebox.showinfo("录音转写", "请先完成录音转写或导入音频。", parent=dialog)
+                return
+            close_dialog()
+            self.root.after_idle(
+                lambda: self.open_ai_interview(
+                    "summary", show_recording=False, source_text=transcript))
+
         if recording_mode:
-            for column, (label, target_type) in enumerate(
-                    (("面试复盘", "interview"), ("会议总结", "meeting"))):
+            for column, (label, handler) in enumerate(
+                    (("转写内容", show_transcript), ("摘要生成", generate_summary))):
                 task_frame.grid_columnconfigure(column, weight=1, uniform="ai-tasks")
                 button = ttk.Button(
                     task_frame, text=label, state="disabled",
-                    command=lambda value=target_type: enter_analysis(value))
+                    command=handler)
                 button.grid(row=0, column=column, sticky="ew", padx=2)
                 analysis_entry_buttons.append(button)
         else:
@@ -2710,7 +2793,7 @@ class StickyNotesApp:
 
         def import_audio():
             path = filedialog.askopenfilename(
-                parent=dialog, title="选择会议录音" if is_meeting else "选择面试录音",
+                parent=dialog, title="选择录音文件",
                 filetypes=(("音频文件", "*.wav *.mp3 *.m4a *.aac *.flac *.ogg"), ("所有文件", "*.*")))
             if path:
                 transcribe_files([(Path(path), "录音")])
@@ -2728,6 +2811,11 @@ class StickyNotesApp:
                 self.voice_recorder = None
                 record_state_var.set(f"● 录音完成  {int(value.duration_seconds)} 秒")
                 record_state_label.configure(fg=c["muted"])
+                recording_tracks.clear()
+                if value.microphone_path:
+                    recording_tracks["麦克风"] = str(value.microphone_path)
+                if value.system_path:
+                    recording_tracks["会议方"] = str(value.system_path)
                 tracks = []
                 if value.microphone_path:
                     tracks.append((value.microphone_path, "我"))
@@ -2743,8 +2831,11 @@ class StickyNotesApp:
                     button.state(["!disabled"])
                 for button in analysis_entry_buttons:
                     button.state(["!disabled"])
+                save_transcript_button.state(["!disabled"])
+                save_audio_button.state(
+                    ["!disabled"] if recording_tracks else ["disabled"])
                 prefix = (state["voice_warning"] + "；") if state["voice_warning"] else ""
-                next_action = "AI 会议总结" if is_meeting else "AI 面试复盘"
+                next_action = "AI 摘要生成" if recording_mode or is_summary else "AI 分析"
                 status_var.set(prefix + f"本地转写完成，可追加到当前笔记后继续进行 {next_action}。")
             else:
                 self.voice_recorder = None
@@ -2773,16 +2864,6 @@ class StickyNotesApp:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(state["result"])
                 status_var.set("结果已复制。")
-
-        def enter_analysis(target_type):
-            transcript = state["result"].strip()
-            if not transcript:
-                messagebox.showinfo("录音转写", "请先完成录音转写或导入音频。", parent=dialog)
-                return
-            close_dialog()
-            self.root.after_idle(
-                lambda: self.open_ai_interview(
-                    target_type, show_recording=False, source_text=transcript))
 
         def result_header():
             if state["mode"] == "transcript":
@@ -2845,6 +2926,7 @@ class StickyNotesApp:
             self.select_note(note["id"], flush_current=False)
             status_var.set("已生成独立会议纪要。" if is_meeting else "已生成独立复盘笔记。")
 
+        recording_tracks = {}  # 存储最近一次录音的音频文件路径
         result_buttons = []
         create_button_text = ("生成独立转写笔记" if recording_mode else
                               "生成独立会议纪要" if is_meeting else "生成独立复盘笔记")
@@ -2853,10 +2935,86 @@ class StickyNotesApp:
             button = ttk.Button(action_frame, text=text_value, command=command)
             button.pack(side="left", padx=(0, 5))
             result_buttons.append(button)
-        cancel_button = ttk.Button(
-            action_frame, text="取消生成",
-            command=lambda: self.ai_cancel_event.set() if self.ai_cancel_event else None)
-        cancel_button.pack(side="right", padx=(5, 0))
+
+        def save_audio():
+            """保存录音音频文件到用户选择的目录"""
+            if not recording_tracks:
+                messagebox.showinfo("保存音频", "没有可保存的录音文件。", parent=dialog)
+                return
+            dest_dir = filedialog.askdirectory(
+                parent=dialog, title="选择保存目录")
+            if not dest_dir:
+                return
+            saved = []
+            for label, src in recording_tracks.items():
+                if src and Path(src).exists():
+                    dst = Path(dest_dir) / f"{label}_{Path(src).name}"
+                    try:
+                        shutil.copy2(src, dst)
+                        saved.append(f"{label}: {dst.name}")
+                    except Exception as exc:
+                        messagebox.showerror("保存失败", f"{label}: {exc}", parent=dialog)
+            if saved:
+                status_var.set("音频已保存：" + "、".join(saved))
+
+        def save_transcript():
+            """保存转写文字到文本文件"""
+            if not state["result"]:
+                messagebox.showinfo("保存转写", "没有可保存的转写内容。", parent=dialog)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=dialog, title="保存转写内容",
+                defaultextension=".txt",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+                initialfile=f"转写_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+            if not path:
+                return
+            try:
+                Path(path).write_text(state["result"], encoding="utf-8")
+                status_var.set(f"转写已保存：{path}")
+            except Exception as exc:
+                messagebox.showerror("保存失败", str(exc), parent=dialog)
+
+        save_audio_button = ttk.Button(action_frame, text="保存音频", command=save_audio)
+        save_audio_button.pack(side="left", padx=(0, 5))
+        save_audio_button.state(["disabled"])
+
+        save_transcript_button = ttk.Button(action_frame, text="保存转写", command=save_transcript)
+        save_transcript_button.pack(side="left", padx=(0, 5))
+        save_transcript_button.state(["disabled"])
+
+        def clear_recording_content():
+            """清空本次录音会话的内存内容，保留已写入磁盘的原始音频。"""
+            recorder = self.voice_recorder
+            if state["busy"] or state["voice_busy"] or (recorder and recorder.is_recording):
+                messagebox.showinfo(
+                    "清空内容", "请先等待当前录音、转写或摘要生成结束，再清空内容。", parent=dialog)
+                return
+            state.update({
+                "result": "", "task": "", "mode": "", "voice_warning": "",
+                "live_offset": 0, "answered_question": "", "answer_stream": "",
+                "answer_timings": {}, "last_sources": [],
+            })
+            # 清空会话引用而不删除实际文件；用户如需保留，应在清空前点击“保存音频”。
+            recording_tracks.clear()
+            set_output("")
+            clear_question("等待录制新的会议声音……")
+            recognized_text_var.set("最近识别文字：等待会议声音……")
+            question_status_var.set("")
+            record_state_var.set("● 未录音")
+            record_state_label.configure(fg=c["muted"])
+            pause_button.configure(text="暂停")
+            pause_button.state(["disabled"])
+            stop_button.state(["disabled"])
+            for button in analysis_entry_buttons + result_buttons:
+                button.state(["disabled"])
+            save_audio_button.state(["disabled"])
+            save_transcript_button.state(["disabled"])
+            set_voice_busy(False)
+            status_var.set("当前内容已清空，可重新开始录音或导入音频。")
+
+        clear_button = ttk.Button(action_frame, text="清空内容", command=clear_recording_content)
+        clear_button.pack(side="right", padx=(5, 0))
 
         def close_dialog():
             if self.ai_cancel_event:
@@ -2879,6 +3037,7 @@ class StickyNotesApp:
                 self.store.settings["voice_dialog_bounds"] = list(window_bounds(dialog))
                 if self.voice_dpi_scaler and self.voice_dpi_scaler.current_dpi:
                     self.store.settings["voice_dialog_dpi"] = self.voice_dpi_scaler.current_dpi
+                self.store.settings["voice_dialog_layout_version"] = 2
                 self.store.save()
                 self.voice_edge_controller = None
                 self.voice_dpi_scaler = None
@@ -2915,10 +3074,11 @@ class StickyNotesApp:
 
                 self.voice_dpi_scaler = WindowDpiScaler(
                     dialog, user_factor=UI_FONT_SCALINGS.get(self.ui_font_size, 1.0),
-                    base_min_size=(640, 560))
+                    base_min_size=(800, 720))
                 if display:
-                    previous_dpi = int(self.store.settings.get("voice_dialog_dpi") or 96)
-                    self.voice_dpi_scaler.apply(display.dpi, previous_dpi=previous_dpi)
+                    # 初次打开时先保留当前安全几何尺寸，仅按当前显示器放大字体和
+                    # 间距；跨屏移动时再由 on_voice_display_enter 做比例换算。
+                    self.voice_dpi_scaler.apply(display.dpi, resize=False)
                 self.voice_edge_controller = EdgeHideController(
                     dialog, enabled=lambda: self.edge_var.get(),
                     gap=self.EDGE_GAP, visible_size=self.HIDDEN_SIZE,
@@ -3057,11 +3217,13 @@ class StickyNotesApp:
         set_window_position(self.root, x, y)
 
     def minimize_window(self):
-        self.minimized = True
+        """隐藏主窗口，仅保留 Windows 通知区域中的托盘图标。"""
+        self.reveal_from_edge()
+        self.flush_save()
         self.stop_all_quick_pulses()
         self.quick_rail.withdraw()
-        self.root.overrideredirect(False)
-        self.root.iconify()
+        self.root.withdraw()
+        self.status_var.set("轻笺正在系统托盘运行")
 
     def on_window_map(self, _event=None):
         if self.minimized:
