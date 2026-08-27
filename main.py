@@ -14,8 +14,6 @@ import webbrowser
 from datetime import date, datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, Optional
-from PIL import Image, ImageTk
-
 from calendar_picker import CalendarPicker
 from dpi_scaler import WindowDpiScaler
 from display_manager import (DisplayArea, EdgeHideController, detect_docked_edge,
@@ -27,6 +25,7 @@ from ai_service import (AIServiceError, INTERVIEW_TASKS, MEETING_TASKS, TRANSCRI
                         analyze_interview, analyze_meeting, analyze_transcript,
                         answer_interview_question,
                         choose_interview_answer_provider, stream_chat_completion)
+from palette import ModernButton, ModernEntry, ModernToggle, apply_palette_to_all
 from storage import NoteStore
 from sensevoice_service import SenseVoiceLiveSession, SenseVoiceTranscriber
 from stepaudio_service import StepAudioASR
@@ -79,6 +78,16 @@ THEMES = {
              "text": "#242526", "muted": "#5f6263", "input": "#eeeeec"},
     "深色": {"bg": "#25272a", "panel": "#17191c", "accent": "#8b929a",
              "text": "#f1f2f3", "muted": "#aeb2b7", "input": "#32353a"},
+    "莫兰迪": {"bg": "#e8e1d3", "panel": "#d4c8b0", "accent": "#a78b6a",
+               "text": "#3a342b", "muted": "#8a7d6a", "input": "#f0ead9"},
+    "赛博": {"bg": "#0d1117", "panel": "#161b22", "accent": "#58a6ff",
+             "text": "#e6edf3", "muted": "#7d8590", "input": "#1c2128"},
+    "水墨": {"bg": "#f5f3ee", "panel": "#e8e5dc", "accent": "#2c2c2c",
+             "text": "#1a1a1a", "muted": "#888888", "input": "#faf8f2"},
+    "糖果": {"bg": "#fff0f5", "panel": "#ffe4ec", "accent": "#ff6b9d",
+             "text": "#5a2a3a", "muted": "#a07588", "input": "#fff5f9"},
+    "薄荷": {"bg": "#e8f5f0", "panel": "#d0ebe0", "accent": "#3cb489",
+             "text": "#1f3a32", "muted": "#6a8a7a", "input": "#f0faf4"},
 }
 
 
@@ -173,7 +182,7 @@ class SegmentedNav(tk.Canvas):
             active = index == self.active_index
             self.create_text(segment * (index + 0.5), 20 * scale, text=text,
                              fill="white" if active else c["muted"],
-                             font=("Microsoft YaHei UI", max(7, round(9 * scale)),
+                             font=("Microsoft YaHei UI", max(7, round(11 * scale)),
                                    "bold" if active else "normal"))
         if self.focus_get() is self:
             x1 = segment * self.focus_index + 4 * scale
@@ -262,6 +271,9 @@ class StickyNotesApp:
         self.resizing = False
         self.compact_mode = False
         self.compact_sash_user_resized = False
+        self.wide_sash_user_resized = False
+        self.rounded_region_job = None
+        self.rounded_region_applying = False
         self.drag_candidate = None
         self.drag_source = None
         self.resize_origin = None
@@ -271,10 +283,9 @@ class StickyNotesApp:
         self.drag_offset = (0, 0)
         self.hovered = False
         self.theme_name = self.store.settings.get("theme", "黄色")
-        if self.theme_name not in THEMES and self.theme_name != "图片皮肤":
+        if self.theme_name not in THEMES:
             self.theme_name = "黄色"
-        self.colors = (self.store.settings.get("image_palette") if self.theme_name == "图片皮肤"
-                       else THEMES[self.theme_name]) or THEMES["黄色"]
+        self.colors = THEMES[self.theme_name]
         self.bg_widgets = []
         self.panel_widgets = []
         self.nav_widgets = []
@@ -329,6 +340,61 @@ class StickyNotesApp:
         except (AttributeError, OSError):
             pass
 
+    @staticmethod
+    def _apply_rounded_region(window, radius=16):
+        """在 Windows 层为无标题栏窗口设置真正的四角圆角区域。"""
+        try:
+            width = window.winfo_width()
+            height = window.winfo_height()
+            if width <= 1 or height <= 1:
+                return
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            hwnd = ctypes.c_void_p(window.winfo_id())
+            # Tk 的 winfo_id 可能指向内部窗口，GA_ROOT 才是实际顶层窗口。
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetAncestor.restype = ctypes.c_void_p
+            hwnd = user32.GetAncestor(hwnd, 2) or hwnd
+            gdi32.CreateRoundRectRgn.argtypes = [
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int]
+            gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
+            user32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+            user32.SetWindowRgn.restype = ctypes.c_int
+            gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteObject.restype = ctypes.c_bool
+            region = gdi32.CreateRoundRectRgn(
+                0, 0, width + 1, height + 1, radius * 2, radius * 2)
+            if not region:
+                return
+            # SetWindowRgn 成功后由 Windows 接管 region，不再手动释放。
+            if not user32.SetWindowRgn(hwnd, region, True):
+                gdi32.DeleteObject(region)
+        except (AttributeError, OSError, tk.TclError, TypeError):
+            # 非 Windows 环境或窗口尚未完成映射时保留矩形窗口，不影响启动。
+            pass
+
+    def _schedule_rounded_region(self, window, radius):
+        """延迟刷新窗口圆角，避免 SetWindowRgn 与 Configure 事件互相触发。"""
+        if window is self.root:
+            if self.rounded_region_applying:
+                return
+            if self.rounded_region_job:
+                try:
+                    self.root.after_cancel(self.rounded_region_job)
+                except tk.TclError:
+                    pass
+            self.rounded_region_job = self.root.after(
+                80, lambda: self._apply_rounded_region_safely(window, radius))
+
+    def _apply_rounded_region_safely(self, window, radius):
+        self.rounded_region_job = None
+        self.rounded_region_applying = True
+        try:
+            self._apply_rounded_region(window, radius)
+        finally:
+            self.rounded_region_applying = False
+
     def _enforce_ui_scaling(self):
         value = 4 / 3
         try:
@@ -347,6 +413,7 @@ class StickyNotesApp:
             ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
             self.root.withdraw()
             self.root.after(10, self.root.deiconify)
+            self.root.after(80, lambda: self._apply_rounded_region(self.root, radius=18))
         except (AttributeError, OSError):
             pass
 
@@ -373,6 +440,7 @@ class StickyNotesApp:
             self.edge_controller.visible_size = max(
                 self.HIDDEN_SIZE, round(self.HIDDEN_SIZE * display.dpi / 96))
         self.edge_controller.start()
+        self._apply_rounded_region(self.root)
         self.root.after_idle(self.position_quick_rail)
 
     def _on_main_edge_hidden(self, edge):
@@ -406,14 +474,8 @@ class StickyNotesApp:
         style = ttk.Style()
         style.theme_use("clam")
         self.style = style
-
-        # 图片皮肤的底层画布必须先创建，后续控件才能自然叠加在背景图片之上。
-        self.background_canvas = tk.Canvas(
-            self.root, bd=0, highlightthickness=0, relief="flat")
-        self.background_canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self.background_photo = None
-        self.background_image_id = None
-        self.background_canvas.bind("<Configure>", self._redraw_background_image)
+        # ttk 下拉框展开后由内部 Listbox 绘制，单独设置其字体才能与输入框一致。
+        self.root.option_add("*TCombobox*Listbox.font", ("Microsoft YaHei UI", 12))
 
         self.titlebar = tk.Frame(self.root, height=34, padx=8)
         self.titlebar.pack(fill="x")
@@ -438,14 +500,24 @@ class StickyNotesApp:
         toolbar.pack(fill="x")
         self.bg_widgets.append(toolbar)
         self.new_button_text = tk.StringVar(value="＋ 新建便签")
-        self.new_button = ttk.Button(toolbar, textvariable=self.new_button_text, command=self.add_note)
+        # 工具栏按钮使用与顶部板块标签接近的字号，避免 Canvas 按钮因未继承
+        # Tk 缩放而显得过小。
+        toolbar_font = ("Microsoft YaHei UI", 14)
+        self.new_button = ModernButton(toolbar, textvariable=None, command=self.add_note,
+                                       width=90, height=34, radius=9, font=toolbar_font)
+        # 兼容 update_toolbar_labels 中对新按钮文字的动态修改
+        self._new_button_text_var = self.new_button_text
+        self.new_button._text_var = self._new_button_text_var
         self.new_button.pack(side="left")
-        self.delete_button = ttk.Button(toolbar, text="删除", command=self.delete_note)
-        self.delete_button.pack(side="left", padx=5)
-        self.pending_button = ttk.Button(toolbar, text="待办", command=lambda: self.set_task_view("pending"))
-        self.pending_button.pack(side="left", padx=5)
-        self.task_button = ttk.Button(toolbar, text="已完成", command=lambda: self.set_task_view("completed"))
-        self.task_button.pack(side="left", padx=5)
+        self.pending_button = ModernButton(toolbar, text="待办",
+                                           command=lambda: self.set_task_view("pending"),
+                                           style="ghost", width=72, height=34, radius=9,
+                                           font=toolbar_font)
+        self.pending_button.pack(side="left", padx=4)
+        self.task_button = ModernButton(
+            toolbar, text="已完成", command=lambda: self.set_task_view("completed"),
+            style="ghost", width=82, height=34, radius=9, font=toolbar_font)
+        self.task_button.pack(side="left", padx=4)
         self.settings_button_text = tk.StringVar(value="⚙ 设置")
         self.settings_button = ttk.Button(toolbar, textvariable=self.settings_button_text,
                                           command=self.toggle_settings)
@@ -481,7 +553,7 @@ class StickyNotesApp:
         self.top_label_var = tk.StringVar()
         self.settings_frame = tk.Frame(self.root, padx=10, pady=7)
         self.bg_widgets.append(self.settings_frame)
-        # 设置板块直接从顶部导航下方开始，不再重复显示“设置”标题。
+        # 设置板块直接从顶部导航下方开始，不再重复显示”设置”标题。
         self.settings_contrast_labels = []
         checks_row = tk.Frame(self.settings_frame)
         checks_row.pack(fill="x", pady=(0, 5))
@@ -522,10 +594,9 @@ class StickyNotesApp:
         self.settings_contrast_labels.append(color_label)
         self.theme_var = tk.StringVar(value=self.theme_name)
         self.theme_box = ttk.Combobox(alpha_row, textvariable=self.theme_var,
-                                      values=list(THEMES) + ["图片皮肤"], state="readonly", width=8)
+                                      values=list(THEMES), state="readonly", width=8,
+                                      font=("Microsoft YaHei UI", 12))
         self.theme_box.pack(side="left")
-        ttk.Button(alpha_row, text="本地图片", command=self.choose_background_image).pack(side="left", padx=(6, 0))
-        ttk.Button(alpha_row, text="恢复纯色", command=self.clear_background_image).pack(side="left", padx=(4, 0))
 
         font_row = tk.Frame(self.settings_frame)
         font_row.pack(fill="x", pady=(6, 0))
@@ -762,8 +833,8 @@ class StickyNotesApp:
         self.settings_visible = False
 
         # 窄窗口时这里的横向分隔条就是底部标题框的可拖动上边框。
-        body = tk.PanedWindow(self.root, orient="horizontal", sashwidth=6,
-                              sashrelief="raised", bd=0, relief="flat")
+        body = tk.PanedWindow(self.root, orient="horizontal", sashwidth=8,
+                              sashpad=2, sashrelief="raised", bd=0, relief="flat")
         body.pack(fill="both", expand=True, padx=8, pady=8)
         left = tk.Frame(body, width=145)
         right = tk.Frame(body)
@@ -1089,14 +1160,13 @@ class StickyNotesApp:
                             bg=self.quick_transparent, bd=0)
             cell.pack(fill="x", pady=3)
             cell.pack_propagate(False)
-            button = tk.Button(cell, text=text,
-                               command=lambda s=slot: self.open_quick_slot(s),
-                               relief="flat", bd=0, padx=4, pady=2,
-                               wraplength=wraplength, font=quick_font,
-                               justify="center",
-                               bg=self.colors["panel"], fg=self.colors["text"],
-                               activebackground=self.colors["accent"],
-                               activeforeground="white", cursor="hand2")
+            # 快捷标签改用统一的圆角 Canvas 按钮，避免原生 tk.Button 的方角边框。
+            button = ModernButton(
+                cell, text=self._wrap_quick_text(text, quick_font, wraplength),
+                command=lambda s=slot: self.open_quick_slot(s),
+                style="ghost", width=width, height=cell_height, radius=12,
+                font=quick_font, cursor="hand2", attached_side="right",
+                canvas_bg=self.quick_transparent)
             button.pack(fill="both", expand=True)
             button.bind("<Enter>", lambda _e, b=button: self.start_quick_pulse(b))
             button.bind("<Leave>", lambda _e, b=button: self.stop_quick_pulse(b))
@@ -1104,6 +1174,22 @@ class StickyNotesApp:
             self.quick_buttons.append(button)
         self.position_quick_rail()
         self.sync_quick_visibility()
+
+    @staticmethod
+    def _wrap_quick_text(text, font, wraplength):
+        """按字体实际宽度换行，确保圆角快捷标签中的长标题完整显示。"""
+        lines = []
+        current = ""
+        for char in str(text):
+            candidate = current + char
+            if current and font.measure(candidate) > wraplength:
+                lines.append(current)
+                current = char
+            else:
+                current = candidate
+        if current or not lines:
+            lines.append(current)
+        return "\n".join(lines)
 
     def _quick_rail_metrics(self):
         """根据完整标题、当前窗口宽度和 DPI 计算统一的快捷标签尺寸。"""
@@ -1149,6 +1235,8 @@ class StickyNotesApp:
         return "#" + "".join(f"{value:02x}" for value in mixed)
 
     def start_quick_pulse(self, button):
+        if isinstance(button, ModernButton):
+            return
         self.stop_quick_pulse(button, restore=False)
         button._quick_pulse_phase = 0
         button._quick_pulse_active = True
@@ -1209,6 +1297,7 @@ class StickyNotesApp:
                 x = max(display.work_left, self.root.winfo_x() - width)
             y = min(max(y, display.work_top), max(display.work_top, display.work_bottom - height))
         self.quick_rail.geometry(f"{width}x{height}")
+        self._apply_rounded_region(self.quick_rail, radius=14)
         set_window_position(self.quick_rail, x, y)
 
     def sync_quick_visibility(self):
@@ -1217,6 +1306,7 @@ class StickyNotesApp:
         if should_show:
             self.quick_rail.deiconify()
             self.position_quick_rail()
+            self.quick_rail.after(40, lambda: self._apply_rounded_region(self.quick_rail, radius=14))
         else:
             self.stop_all_quick_pulses()
             self.quick_rail.withdraw()
@@ -1352,7 +1442,15 @@ class StickyNotesApp:
             return
         fixed = any(q.get("source_type") == source["source_type"] and
                     q.get("source_id") == source["source_id"] for q in self.store.quick_slots)
-        menu = tk.Menu(self.root, tearoff=False)
+        is_sticky_journal = source.get("source_type") in ("sticky", "journal")
+        # 右键菜单与标题列表使用同一字体，随界面缩放保持一致。
+        menu = tk.Menu(self.root, tearoff=False, font=self.listbox.cget("font"))
+        if is_sticky_journal:
+            menu.add_command(label="复制",
+                             command=lambda s=source: self.copy_note_by_source(s))
+        if is_sticky_journal or source.get("source_type") == "reminder":
+            menu.add_command(label="删除",
+                             command=lambda s=source: self.delete_note_by_source(s))
         menu.add_command(label="已固定到快捷标签" if fixed else "固定到快捷标签",
                          state="disabled" if fixed else "normal",
                          command=lambda s=source: self.add_quick_source(
@@ -1365,13 +1463,14 @@ class StickyNotesApp:
             return
         self.compact_mode = compact
         self.compact_sash_user_resized = False
+        self.wide_sash_user_resized = False
         for pane in (self.left_panel, self.right_panel):
             if str(pane) in self.body.panes():
                 self.body.forget(pane)
         if compact:
             self.body.configure(orient="vertical")
-            self.body.add(self.left_panel, minsize=85)
-            self.body.add(self.right_panel, before=self.left_panel, minsize=150)
+            self.body.add(self.left_panel, minsize=180)
+            self.body.add(self.right_panel, before=self.left_panel, minsize=120)
             self.category_filter.pack_forget()
             self.search_entry.pack_forget()
             self.category_filter.pack(side="left", fill="x", expand=True)
@@ -1389,14 +1488,16 @@ class StickyNotesApp:
 
     def remember_compact_sash(self, event):
         """用户拖动窄窗口分隔条后，保留其手动设置的标题框高度。"""
-        if not self.compact_mode or len(self.body.panes()) != 2:
+        if len(self.body.panes()) != 2:
             return
         try:
-            sash_y = self.body.sash_coord(0)[1]
+            sash_x, sash_y = self.body.sash_coord(0)
         except tk.TclError:
             return
-        if abs(event.y - sash_y) <= 12:
+        if self.compact_mode and abs(event.y - sash_y) <= 12:
             self.compact_sash_user_resized = True
+        elif not self.compact_mode and abs(event.x - sash_x) <= 12:
+            self.wide_sash_user_resized = True
 
     def position_compact_sash(self, force=False):
         if (not self.compact_mode or len(self.body.panes()) != 2 or
@@ -1408,12 +1509,13 @@ class StickyNotesApp:
         filter_height = 36 if self.current_section == "journal" else 0
         # 默认高度严格按当前标题条数计算；标题框底部由下方面板自动贴住窗口底边。
         list_height = max(1, self.listbox.size()) * row_height + filter_height + 12
-        list_height = min(list_height, max(row_height + filter_height + 12, available - 150))
-        sash_y = max(150, available - list_height)
+        list_height = min(list_height, max(row_height + filter_height + 12, available - 120))
+        sash_y = min(max(120, available - list_height), max(120, available - 40))
         self.body.sash_place(0, 0, sash_y)
 
     def position_wide_sash(self):
-        if self.compact_mode or len(self.body.panes()) != 2 or not self.body.winfo_ismapped():
+        if (self.compact_mode or self.wide_sash_user_resized or
+                len(self.body.panes()) != 2 or not self.body.winfo_ismapped()):
             return
         font = tkfont.Font(font=self.listbox.cget("font"))
         titles = self.listbox.get(0, "end")
@@ -1466,22 +1568,27 @@ class StickyNotesApp:
         self.show_news_title(True)
 
     def apply_theme(self, save=True):
-        palette = self.store.settings.get("image_palette") if self.theme_name == "图片皮肤" else None
-        self.colors = palette if isinstance(palette, dict) else THEMES.get(self.theme_name, THEMES["黄色"])
+        self.colors = THEMES.get(self.theme_name, THEMES["黄色"])
         c = self.colors
         self.root.configure(bg=c["bg"])
-        self._redraw_background_image()
+        # QQ 风格：容器面板透明（= root bg），让背景图透出；
+        # 只有列表/编辑器/输入框等需要可读性的区域才用 panel 色。
         for widget in self.bg_widgets:
             widget.configure(bg=c["bg"])
         for widget in self.panel_widgets:
-            widget.configure(bg=c["panel"])
+            widget.configure(bg=c["bg"])
         for label in self.muted_labels:
             label.configure(bg=c["bg"], fg=c["muted"])
         for label in self.settings_contrast_labels:
             label.configure(bg=c["bg"], fg=c["text"])
-        self.app_title.configure(bg=c["panel"], fg=c["text"])
+        self.app_title.configure(bg=c["bg"], fg=c["text"])
+        self.titlebar.configure(bg=c["bg"])
+        self.body.configure(bg=c["bg"])
+        self.left_panel.configure(bg=c["bg"])
+        if hasattr(self, "right_panel"):
+            self.right_panel.configure(bg=c["bg"])
         for button in (self.min_button, self.close_button):
-            button.configure(bg=c["panel"], fg=c["text"],
+            button.configure(bg=c["bg"], fg=c["text"],
                              activebackground=c["accent"], activeforeground="white")
         for check in (self.top_check, self.edge_check, self.autostart_check):
             check.configure(bg=c["bg"], fg=c["text"], selectcolor=c["bg"],
@@ -1489,7 +1596,6 @@ class StickyNotesApp:
         self.section_nav.set_theme(c)
         self.section_nav.set_counts({"reminder": sum(
             1 for r in self.store.reminders if r.get("status") in ("pending", "notified"))})
-        # 未手动拖动过分隔条时，以当前标题条数设定默认高度。
         if self.compact_mode and not self.compact_sash_user_resized:
             self.root.after_idle(self.position_compact_sash)
         self.root.after_idle(self.adjust_responsive_sash)
@@ -1499,17 +1605,18 @@ class StickyNotesApp:
         self.quick_buttons_frame.configure(bg=self.quick_transparent)
         for button in getattr(self, "quick_buttons", []):
             self.stop_quick_pulse(button)
-            button.configure(bg=c["panel"], fg=c["text"],
-                             activebackground=c["accent"], activeforeground="white")
+            if isinstance(button, ModernButton):
+                button.apply_palette(c)
+            else:
+                button.configure(bg=c["panel"], fg=c["text"],
+                                 activebackground=c["accent"], activeforeground="white")
         self.quick_rail.attributes("-alpha", float(self.store.settings["alpha"]))
-        self.body.configure(bg=c["panel"])
+        # 内容区域保留 panel 色，形成 QQ 风格的可读面板。
         self.listbox.configure(bg=c["panel"], fg=c["text"],
                                selectbackground=c["accent"])
         for widget in (self.title_entry, self.editor):
-            widget.configure(bg=c["bg"], fg=c["text"], insertbackground=c["text"])
-        self.editor.tag_configure("task_marker", foreground=c["accent"], underline=1)
-        self.editor.tag_configure("task_done", foreground=c["muted"], overstrike=1)
-        self.news_title_label.configure(bg=c["bg"], fg=c["text"])
+            widget.configure(bg=c["panel"], fg=c["text"], insertbackground=c["text"])
+        self.news_title_label.configure(bg=c["panel"], fg=c["text"])
         for entry in self.ai_setting_entries:
             entry.configure(bg=c["input"], fg=c["text"], insertbackground=c["text"])
         for button in (self.ai_model_button, self.ai_reasoning_button):
@@ -1518,12 +1625,24 @@ class StickyNotesApp:
         for menu in (self.ai_model_menu, self.ai_reasoning_menu):
             menu.configure(bg=c["panel"], fg=c["text"], activebackground=c["accent"],
                            activeforeground="white")
-        self.style.configure("TButton", background=c["panel"], foreground=c["text"], padding=5)
-        self.style.map("TButton", background=[("selected", c["accent"]), ("active", c["accent"])],
-                       foreground=[("selected", "white"), ("active", "white")])
-        self.style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
-        self.style.configure("Horizontal.TScale", background=c["bg"])
-        self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"])
+        self.style.configure("TButton", background=c["panel"], foreground=c["text"],
+                             padding=(10, 6), font=("Microsoft YaHei UI", 10),
+                             borderwidth=0, focusthickness=0)
+        self.style.map("TButton",
+                       background=[("selected", c["accent"]), ("active", c["accent"]),
+                                   ("pressed", c["accent"]), ("disabled", c["panel"])],
+                       foreground=[("selected", "white"), ("active", "white"),
+                                   ("disabled", c["muted"])])
+        self.style.configure("TCheckbutton", background=c["panel"], foreground=c["text"],
+                             focuscolor=c["accent"])
+        self.style.configure("Horizontal.TScale", background=c["bg"], troughcolor=c["panel"])
+        self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"],
+                             background=c["panel"], bordercolor=c["panel"],
+                             arrowcolor=c["text"], padding=(6, 4),
+                             font=("Microsoft YaHei UI", 12))
+        self.style.map("TCombobox",
+                       fieldbackground=[("readonly", c["input"]), ("disabled", c["panel"])],
+                       foreground=[("readonly", c["text"]), ("disabled", c["muted"])])
         toolbar_font = self.style.lookup("TButton", "font") or "TkDefaultFont"
         toolbar_padding = self.style.lookup("TButton", "padding") or 5
         self.style.configure("NewsTab.TButton", background=c["panel"], foreground=c["text"],
@@ -1531,6 +1650,8 @@ class StickyNotesApp:
         self.style.map("NewsTab.TButton",
                        background=[("selected", c["accent"]), ("active", c["accent"])],
                        foreground=[("selected", "white"), ("active", "white")])
+        # 通知所有 ModernButton/ModernEntry/ModernToggle 同步新调色板
+        apply_palette_to_all(c)
         self.update_news_tabs()
         if save:
             self.store.settings["theme"] = self.theme_name
@@ -1539,97 +1660,6 @@ class StickyNotesApp:
     def change_theme(self, _event=None):
         self.theme_name = self.theme_var.get()
         self.apply_theme()
-
-    def choose_background_image(self):
-        source = filedialog.askopenfilename(
-            title="选择本地皮肤图片", filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.webp")])
-        if not source:
-            return
-        try:
-            image = Image.open(source).convert("RGB")
-            skin_dir = Path("D:/QingjianData/轻笺/skins")
-            skin_dir.mkdir(parents=True, exist_ok=True)
-            target = skin_dir / f"skin-{int(time.time())}{Path(source).suffix.lower()}"
-            shutil.copy2(source, target)
-            self.store.settings["background_image"] = str(target)
-            self.store.settings["image_palette"] = self.image_skin_palette(image)
-            self.theme_name = "图片皮肤"
-            self.theme_var.set(self.theme_name)
-            self.apply_theme()
-        except (OSError, ValueError) as error:
-            messagebox.showerror("皮肤图片", f"无法使用该图片：{error}", parent=self.root)
-
-    def clear_background_image(self):
-        self.store.settings["background_image"] = ""
-        self.store.settings.pop("image_palette", None)
-        if self.theme_name == "图片皮肤":
-            self.theme_name = "黄色"
-            self.theme_var.set(self.theme_name)
-            self.apply_theme()
-            return
-        self.store.save()
-
-    def _redraw_background_image(self, _event=None):
-        """按窗口比例裁切并绘制图片皮肤；无图片时仅保留纯色背景。"""
-        if not hasattr(self, "background_canvas"):
-            return
-        canvas = self.background_canvas
-        width = canvas.winfo_width()
-        height = canvas.winfo_height()
-        if width <= 1 or height <= 1:
-            return
-
-        canvas.configure(bg=self.colors["bg"])
-        canvas.delete("background_image")
-        self.background_photo = None
-        image_path = self.store.settings.get("background_image", "")
-        if self.theme_name != "图片皮肤" or not image_path:
-            return
-        try:
-            image = Image.open(image_path).convert("RGB")
-            source_width, source_height = image.size
-            scale = max(width / source_width, height / source_height)
-            resized = image.resize(
-                (max(width, round(source_width * scale)),
-                 max(height, round(source_height * scale))),
-                Image.Resampling.LANCZOS)
-            left = max(0, (resized.width - width) // 2)
-            top = max(0, (resized.height - height) // 2)
-            resized = resized.crop((left, top, left + width, top + height))
-            self.background_photo = ImageTk.PhotoImage(resized)
-            self.background_image_id = canvas.create_image(
-                width // 2, height // 2, image=self.background_photo,
-                anchor="center", tags="background_image")
-            canvas.lower(self.background_image_id)
-        except (OSError, ValueError, tk.TclError):
-            # 图片丢失或格式不可读时回退到已提取的纯色调色板。
-            self.background_photo = None
-
-    @staticmethod
-    def image_skin_palette(image):
-        """从本地图片提取主色，并生成可读的完整 Tkinter 皮肤调色板。"""
-        sample = image.resize((80, 80)).quantize(colors=8).convert("RGB")
-        colors = sample.getcolors(sample.width * sample.height) or []
-        red, green, blue = max(colors, key=lambda item: item[0])[1]
-
-        def mix(color, target, ratio):
-            return tuple(round(value * (1 - ratio) + goal * ratio)
-                         for value, goal in zip(color, target))
-
-        def as_hex(color):
-            return "#{:02x}{:02x}{:02x}".format(*color)
-
-        luminance = (red * 299 + green * 587 + blue * 114) / 1000
-        dark_text = luminance > 145
-        base = (red, green, blue)
-        return {
-            "bg": as_hex(mix(base, (255, 255, 255) if dark_text else (0, 0, 0), 0.38)),
-            "panel": as_hex(mix(base, (255, 255, 255) if dark_text else (0, 0, 0), 0.55)),
-            "input": as_hex(mix(base, (255, 255, 255) if dark_text else (0, 0, 0), 0.25)),
-            "accent": as_hex(mix(base, (40, 160, 255) if dark_text else (110, 205, 255), 0.48)),
-            "text": "#1f2428" if dark_text else "#f7fbff",
-            "muted": "#53616d" if dark_text else "#c6d5e1",
-        }
 
     @staticmethod
     def ai_profile_key(provider, field):
@@ -3101,7 +3131,7 @@ class StickyNotesApp:
         self.news_tabs_frame.pack_forget()
 
     def clear_toolbar_layout(self):
-        buttons = (self.new_button, self.delete_button, self.pending_button, self.task_button, self.calendar_button,
+        buttons = (self.new_button, self.pending_button, self.task_button, self.calendar_button,
                    self.news_refresh_button, self.news_home_button,
                    self.news_source_button, self.record_button, self.settings_button)
         for button in buttons:
@@ -3116,6 +3146,8 @@ class StickyNotesApp:
                     "journal": "＋ 新建笔记"}
         if self.current_section in full_new:
             self.new_button_text.set("＋ 新建" if compact else full_new[self.current_section])
+            if hasattr(self.new_button, "set_text"):
+                self.new_button.set_text(self.new_button_text.get())
         self.calendar_button.configure(text="📅 日历" if compact else "📅 日历视图")
         if self.news_mode == "flash":
             self.news_home_button.configure(text="快讯" if compact else "打开快讯页")
@@ -3136,15 +3168,13 @@ class StickyNotesApp:
             buttons = (self.news_refresh_button, self.news_home_button,
                        self.news_source_button, self.settings_button)
         elif self.current_section == "reminder":
-            buttons = (self.new_button, self.delete_button,
-                       self.calendar_button, self.settings_button)
+            buttons = (self.new_button, self.calendar_button, self.settings_button)
         elif self.current_section == "journal":
-            buttons = (self.new_button, self.delete_button,
-                       self.pending_button, self.task_button, self.record_button)
+            buttons = (self.new_button, self.pending_button, self.task_button,
+                       self.record_button)
         else:
-            buttons = (self.new_button, self.delete_button,
-                       self.pending_button, self.task_button)
-        for column in range(5):
+            buttons = (self.new_button, self.pending_button, self.task_button)
+        for column in range(6):
             self.toolbar.grid_columnconfigure(
                 column, weight=1 if column < len(buttons) else 0,
                 uniform="section-actions" if column < len(buttons) else "")
@@ -3210,6 +3240,16 @@ class StickyNotesApp:
         self.drag_offset = (event.x_root - self.root.winfo_x(),
                             event.y_root - self.root.winfo_y())
         self.reveal_from_edge()
+        # 把 motion/release 绑到 root，鼠标移出标题栏也不会中断拖动。
+        self.root.bind("<B1-Motion>", self.drag_window)
+        self.root.bind("<ButtonRelease-1>", self.end_window_drag)
+
+    def end_window_drag(self, _event=None):
+        try:
+            self.root.unbind("<B1-Motion>")
+            self.root.unbind("<ButtonRelease-1>")
+        except tk.TclError:
+            pass
 
     def drag_window(self, event):
         x = event.x_root - self.drag_offset[0]
@@ -3261,6 +3301,73 @@ class StickyNotesApp:
         if result.get("open_ai"):
             self.root.after_idle(lambda value=result["open_ai"]:
                                  self.open_ai_interview(value, show_recording=False))
+
+    def copy_note(self):
+        """复制当前选中的便签/笔记，创建副本并选中编辑。"""
+        if not self.current:
+            return
+        if self.current_section in ("news", "reminder"):
+            return
+        self.flush_save()
+        source = self.current
+        title = source.get("title", "无标题")
+        # 去掉已有"副本"后缀再追加，避免多次复制后变成"副本 (副本)"
+        base_title = title.replace(" (副本)", "").replace("副本", "").strip()
+        if base_title:
+            new_title = base_title + " (副本)"
+        else:
+            new_title = "副本"
+        note = self.store.new_note(
+            title=new_title,
+            content=source.get("content", ""),
+            formats=[dict(f) for f in (source.get("formats") or [])],
+            kind=source.get("kind", "sticky"),
+            category=source.get("category", ""),
+            tags=list(source.get("tags") or []),
+        )
+        if source.get("kind") != "journal":
+            source_reminder = source.get("reminder", "")
+            if source_reminder:
+                self.store.set_source_reminder(note, source_reminder,
+                                               source.get("repeat", "none"))
+        self.refresh_list()
+        self.select_note(note["id"], flush_current=False)
+
+    def copy_note_by_source(self, source):
+        """右键菜单：根据列表数据源复制便签/笔记。"""
+        source_type = source.get("source_type")
+        source_id = source.get("source_id")
+        if source_type not in ("sticky", "journal"):
+            return
+        # 列表来源只保存 source_id；先恢复真实记录，才能完整继承正文、格式、标签等数据。
+        note = next((item for item in self.store.notes
+                     if item.get("id") == source_id), None)
+        if not note:
+            return
+        self.current_section = source_type
+        self.current = note
+        self.copy_note()
+
+    def delete_note_by_source(self, source):
+        """右键菜单：根据列表数据源删除便签/笔记。"""
+        source_type = source.get("source_type")
+        source_id = source.get("source_id")
+        if source_type == "reminder":
+            reminder = next((item for item in self.store.reminders
+                             if item.get("id") == source_id), None)
+            if not reminder:
+                return
+            self.current_section = "reminder"
+            self.current_reminder = reminder
+        else:
+            # 右键列表项只存 source_id；删除前恢复为真实记录，避免误用不存在的 id 字段。
+            note = next((item for item in self.store.notes
+                         if item.get("id") == source_id), None)
+            if not note:
+                return
+            self.current_section = source_type or "sticky"
+            self.current = note
+        self.delete_note(parent=self.listbox)
 
     def pick_datetime(self, value: str = "", parent=None):
         try:
@@ -3497,6 +3604,8 @@ class StickyNotesApp:
         labels = {"reminder": "＋ 新建提醒", "sticky": "＋ 新建便签",
                   "journal": "＋ 新建笔记", "news": "新闻"}
         self.new_button_text.set(labels[section])
+        if hasattr(self.new_button, "set_text"):
+            self.new_button.set_text(self.new_button_text.get())
         self.section_nav.set_active(section)
 
         # 先清空各板块的附属控件，再按目标板块重建，确保重复调用也安全。
@@ -4362,13 +4471,14 @@ class StickyNotesApp:
             else:
                 self.toggle_task_line(self.editor, line_number)
 
-    def delete_note(self):
+    def delete_note(self, parent=None):
+        _parent = parent or self.root
         if self.current_section in ("news",):
             return
         if self.current_section == "reminder":
             if not self.current_reminder:
                 return
-            if messagebox.askyesno("删除提醒", "确定删除当前提醒吗？", parent=self.root):
+            if messagebox.askyesno("删除提醒", "确定删除当前提醒吗？", parent=_parent):
                 self.store.delete_reminder(self.current_reminder["id"])
                 self.current_reminder = None
                 self.refresh_list()
@@ -4379,7 +4489,7 @@ class StickyNotesApp:
             return
         if not self.current:
             return
-        if not messagebox.askyesno("删除便签", "确定删除当前便签吗？", parent=self.root):
+        if not messagebox.askyesno("删除便签", "确定删除当前便签吗？", parent=_parent):
             return
         self.store.delete(self.current["id"])
         self.current = None
@@ -4726,6 +4836,7 @@ class StickyNotesApp:
 
     def on_configure(self, event):
         if event.widget is self.root and not self.hidden_edge and self.root.state() == "normal":
+            self._schedule_rounded_region(self.root, radius=18)
             self._enforce_ui_scaling()
             self.store.settings["geometry"] = self.root.geometry()
             self.store.settings["window_bounds"] = list(window_bounds(self.root))

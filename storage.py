@@ -25,6 +25,8 @@ DEFAULT_SETTINGS = {
     "voice_dialog_bounds": None,
     "voice_dialog_dpi": None,
     "ui_font_size": "标准",
+    "background_blur": 0,
+    "background_darken": 0,
     "ai_base_url": STEP_PLAN_BASE_URL,
     "ai_model": STEP_PLAN_MODEL,
     "ai_reasoning_effort": "low",
